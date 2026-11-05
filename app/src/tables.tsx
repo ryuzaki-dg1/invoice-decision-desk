@@ -1,7 +1,8 @@
 import { useMemo, useState } from "react";
 import { ArrowRight, FileText, Search } from "lucide-react";
 import { ACTION_GROUPS, REASON_LABEL, SHORT, requiredAction } from "./copy";
-import { isOpen, money } from "./lib/engine";
+import { money } from "./lib/engine";
+import { openCases } from "./lib/analytics";
 import { openCodes } from "./lib/review";
 import type { CaseStatus, CheckAction, RunRecord } from "./types";
 import { Empty, SEVERITY, SeverityDot, SkeletonRows, StatusBadge, fmtDate, fmtSecs, timeAgo, topFinding } from "./ui";
@@ -14,8 +15,8 @@ export type QueueItem = RunRecord & { why: string; actionKey: string; actionLabe
 
 // Transparent priority: severity first, then money at stake, then time waiting.
 export function prioritise(runs: RunRecord[]): QueueItem[] {
-  return runs
-    .filter((r) => isOpen(r.status))
+  // One entry per invoice case (repeat uploads never create extra work items).
+  return openCases(runs)
     .map((r) => {
       const f = topFinding(r);
       const sev = f?.action ?? "review";

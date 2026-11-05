@@ -2,7 +2,8 @@ import { useState } from "react";
 import { Search } from "lucide-react";
 import { PURCHASE_ORDERS } from "../data/purchaseOrders";
 import { ERP_LEDGER, VENDORS } from "../data/vendors";
-import { buildLedger, isConfirmed, isOpen, maskAccount, money } from "../lib/engine";
+import { buildLedger, isConfirmed, maskAccount, money } from "../lib/engine";
+import { openCases } from "../lib/analytics";
 import { Tabs } from "../runView";
 import { Shell } from "../Shell";
 import { useRuns } from "../ui";
@@ -20,7 +21,7 @@ export default function Reference() {
   const hit = (...xs: (string | null | undefined)[]) => !needle || xs.some((x) => x?.toLowerCase().includes(needle));
 
   return (
-    <Shell page="reference" openCount={runs.filter((r) => isOpen(r.status)).length}>
+    <Shell page="reference" openCount={openCases(runs).length}>
       <header className="page-head">
         <div>
           <h1 className="h1">Reference data</h1>

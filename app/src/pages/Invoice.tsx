@@ -1,5 +1,5 @@
 import { Investigation } from "../investigation";
-import { isOpen } from "../lib/engine";
+import { openCases } from "../lib/analytics";
 import { Shell } from "../Shell";
 import { Empty, SkeletonRows, useRuns, useToast } from "../ui";
 
@@ -17,7 +17,7 @@ export default function InvoicePage({ id }: { id: string }) {
   const from = new URLSearchParams(window.location.search).get("from") ?? "history";
   const [backHref, backLabel] = BACK[from] ?? BACK.history;
   const page = from === "queue" ? "queue" : from === "overview" ? "overview" : "history";
-  const openCount = runs.filter((r) => isOpen(r.status)).length;
+  const openCount = openCases(runs).length;
   const crumbs = (
     <>
       <a href={backHref}>{backLabel}</a>

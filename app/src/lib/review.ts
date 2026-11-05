@@ -2,23 +2,31 @@
 // show what's allowed) and on the server (to enforce it), so a client cannot
 // approve past an unresolved financial control.
 //
-// Controls that need a specific resolution before approval:
-//   BANK_ACCOUNT_MISMATCH  → "Record independent bank verification"
-//   PO_MATCH_UNCONFIRMED   → "Confirm suggested PO"
-//   UNKNOWN_VENDOR / VENDOR_BLOCKED / PO_VENDOR_MISMATCH / DUPLICATE_INVOICE
-//                          → cannot be resolved here (vendor master / reject)
-// Every other review-level finding is resolved by a reviewer approving with a
-// written justification.
+// Every blocking finding needs its OWN explicit resolution before Approve
+// unlocks. Resolving one finding never approves an invoice that still has
+// another open finding; the status is recomputed from what remains.
+//
+//   BANK_ACCOUNT_MISMATCH              → verify_bank (recorded call-back)
+//   PO_MATCH_UNCONFIRMED               → confirm_po
+//   HANDWRITTEN / LOW_EXTRACTION       → confirm_fields
+//   PO value / qty / price / expiry…   → resolve_po (authorised amendment, with reference)
+//   ARITHMETIC / MISSING_FIELD /
+//   MISSING_PO_REFERENCE / UNKNOWN_PO  → correct the fields (server re-runs every rule)
+//   POSSIBLE_DUPLICATE / OVER_LIMIT    → approve with justification (judgement calls)
+//   UNKNOWN_VENDOR / VENDOR_BLOCKED /
+//   PO_VENDOR_MISMATCH / DUPLICATE     → cannot be resolved here
 
 import type { AuditEvent, CaseStatus, ExceptionCode, RunRecord } from "../types.ts";
 
-export type ReviewActionId = "verify_bank" | "confirm_po" | "confirm_fields" | "approve" | "request_info" | "keep_on_hold" | "reject";
+export type ReviewActionId = "verify_bank" | "confirm_po" | "confirm_fields" | "resolve_po" | "approve" | "request_info" | "keep_on_hold" | "reject";
 
 export interface ReviewRequest {
   action: ReviewActionId;
   reviewer: string;
   justification: string;
   verificationConfirmed?: boolean;
+  authorizedBy?: string; // resolve_po: PO owner / budget holder who authorised
+  reference?: string; // resolve_po: amendment or approval reference
 }
 
 export interface ActionOption {
@@ -27,41 +35,48 @@ export interface ActionOption {
   allowed: boolean;
   blockedReason?: string;
   needsVerification?: boolean;
+  needsAuthorization?: boolean;
+  resolves?: ExceptionCode[];
   tone: "primary" | "neutral" | "danger";
 }
 
-const UNRESOLVABLE: ExceptionCode[] = ["UNKNOWN_VENDOR", "VENDOR_BLOCKED", "PO_VENDOR_MISMATCH", "DUPLICATE_INVOICE"];
+export const UNRESOLVABLE: ExceptionCode[] = ["UNKNOWN_VENDOR", "VENDOR_BLOCKED", "PO_VENDOR_MISMATCH", "DUPLICATE_INVOICE"];
+export const PO_DISCREPANCY: ExceptionCode[] = ["CUMULATIVE_PO_EXCEEDED", "PO_AMOUNT_EXCEEDED", "QUANTITY_EXCEEDS_PO", "PRICE_VARIANCE", "PENDING_PO_CONFLICT", "EXPIRED_PO", "CLOSED_PO", "LINE_NOT_ON_PO", "CURRENCY_MISMATCH"];
+export const NEEDS_CORRECTION: ExceptionCode[] = ["ARITHMETIC_MISMATCH", "MISSING_FIELD", "MISSING_PO_REFERENCE", "UNKNOWN_PO"];
+const FIELD_CONFIRM: ExceptionCode[] = ["HANDWRITTEN_DOCUMENT", "LOW_EXTRACTION_CONFIDENCE"];
+// Judgement calls a reviewer may accept with a written justification.
+const APPROVE_RESOLVES: ExceptionCode[] = ["POSSIBLE_DUPLICATE", "OVER_APPROVAL_LIMIT"];
 
 export function openCodes(run: RunRecord): ExceptionCode[] {
   const resolved = new Set(run.resolvedCodes ?? []);
-  return run.findings.filter((f) => f.action !== "info" && !resolved.has(f.code)).map((f) => f.code);
+  return [...new Set(run.findings.filter((f) => f.action !== "info" && !resolved.has(f.code)).map((f) => f.code))];
 }
 
 export function availableActions(run: RunRecord): ActionOption[] {
   if (run.status === "approved" || run.status === "rejected") return [];
   const open = openCodes(run);
-  const has = (c: ExceptionCode) => open.includes(c);
+  const has = (...c: ExceptionCode[]) => c.some((x) => open.includes(x));
   const hardBlock = open.find((c) => UNRESOLVABLE.includes(c));
   const out: ActionOption[] = [];
 
-  if (has("BANK_ACCOUNT_MISMATCH")) {
-    out.push({ id: "verify_bank", label: "Record independent bank verification", allowed: true, needsVerification: true, tone: "primary" });
-  }
-  if (has("HANDWRITTEN_DOCUMENT") || has("LOW_EXTRACTION_CONFIDENCE")) {
-    out.push({ id: "confirm_fields", label: "Confirm figures match the document", allowed: true, tone: "primary" });
-  }
-  if (has("PO_MATCH_UNCONFIRMED")) {
-    out.push({ id: "confirm_po", label: `Confirm suggested PO ${run.poMatch.po?.id ?? ""}`.trim(), allowed: true, tone: "primary" });
+  if (has("BANK_ACCOUNT_MISMATCH")) out.push({ id: "verify_bank", label: "Verify payment details", allowed: true, needsVerification: true, resolves: ["BANK_ACCOUNT_MISMATCH"], tone: "primary" });
+  if (has(...FIELD_CONFIRM)) out.push({ id: "confirm_fields", label: "Confirm extracted information", allowed: true, resolves: open.filter((c) => FIELD_CONFIRM.includes(c)), tone: "primary" });
+  if (has("PO_MATCH_UNCONFIRMED")) out.push({ id: "confirm_po", label: `Confirm suggested PO ${run.poMatch.po?.id ?? ""}`.trim(), allowed: true, resolves: ["PO_MATCH_UNCONFIRMED"], tone: "primary" });
+  if (has(...PO_DISCREPANCY)) {
+    out.push({ id: "resolve_po", label: "Resolve PO discrepancy", allowed: true, needsAuthorization: true, resolves: open.filter((c) => PO_DISCREPANCY.includes(c)), tone: "primary" });
   }
 
+  // Approve only when nothing material is open.
+  const blocking = open.filter((c) => !APPROVE_RESOLVES.includes(c));
   let approveBlock: string | undefined;
-  if (hardBlock === "UNKNOWN_VENDOR") approveBlock = "Vendor is not in the vendor master. Procurement must onboard it before any approval.";
+  if (hardBlock === "UNKNOWN_VENDOR") approveBlock = "Vendor isn't in the vendor master. Procurement must onboard and verify it first.";
   else if (hardBlock) approveBlock = "An unresolvable control is open (vendor or duplicate).";
-  else if (has("BANK_ACCOUNT_MISMATCH")) approveBlock = "Record independent bank verification first.";
-  else if (has("ARITHMETIC_MISMATCH") || has("MISSING_FIELD")) approveBlock = "The invoice still doesn't reconcile or is missing required fields. Correct the fields, or request a corrected invoice.";
-  else if (has("HANDWRITTEN_DOCUMENT") || has("LOW_EXTRACTION_CONFIDENCE")) approveBlock = "Confirm the figures against the original document first.";
-  else if (has("PO_MATCH_UNCONFIRMED")) approveBlock = "Confirm the suggested PO first.";
-  out.push({ id: "approve", label: open.length ? "Approve (issues resolved)" : "Approve", allowed: !approveBlock, blockedReason: approveBlock, tone: "primary" });
+  else if (blocking.length) {
+    const names: Partial<Record<ExceptionCode, string>> = { BANK_ACCOUNT_MISMATCH: "verify payment details", PO_MATCH_UNCONFIRMED: "confirm the PO", HANDWRITTEN_DOCUMENT: "confirm the extracted information", LOW_EXTRACTION_CONFIDENCE: "confirm the extracted information" };
+    const steps = [...new Set(blocking.map((c) => names[c] ?? (PO_DISCREPANCY.includes(c) ? "resolve the PO discrepancy" : NEEDS_CORRECTION.includes(c) ? "correct the extracted fields" : c)))];
+    approveBlock = `Still open: ${steps.join(", ")}.`;
+  }
+  out.push({ id: "approve", label: "Approve for payment run", allowed: !approveBlock, blockedReason: approveBlock, resolves: open.filter((c) => APPROVE_RESOLVES.includes(c)), tone: "primary" });
 
   out.push({
     id: "request_info",
@@ -76,18 +91,19 @@ export function availableActions(run: RunRecord): ActionOption[] {
 }
 
 const ACTION_TEXT: Record<ReviewActionId, string> = {
-  verify_bank: "Recorded independent bank verification",
+  verify_bank: "Verified payment details by independent call-back",
   confirm_po: "Confirmed suggested PO",
-  confirm_fields: "Confirmed extracted figures against the original document",
-  approve: "Approved after review",
-  request_info: "Requested clarification from vendor",
+  confirm_fields: "Confirmed extracted information against the original document",
+  resolve_po: "Resolved PO discrepancy with authorisation",
+  approve: "Approved for payment run",
+  request_info: "Requested information",
   keep_on_hold: "Kept on hold",
   reject: "Rejected submission",
 };
 
-// Status once a control is resolved: holds clear to review, review clears to
-// approved only through an explicit approve.
-function statusAfterResolve(run: RunRecord, resolved: ExceptionCode[]): CaseStatus {
+// Recompute status from the findings that remain after a resolution: holds
+// clear to review, review clears to approved only through an explicit approve.
+export function statusFromOpen(run: RunRecord, resolved: ExceptionCode[]): CaseStatus {
   const remaining = run.findings.filter((f) => f.action !== "info" && !resolved.includes(f.code));
   if (remaining.some((f) => f.action === "reject")) return "rejected";
   if (remaining.some((f) => f.action === "escalate")) return "payment_hold";
@@ -100,29 +116,24 @@ export function applyReviewAction(run: RunRecord, req: ReviewRequest, now = Date
   if (!reviewer) return { ok: false, error: "Reviewer name is required." };
   if (justification.length < 5) return { ok: false, error: "A justification is required for the audit trail." };
   const option = availableActions(run).find((o) => o.id === req.action);
-  if (!option) return { ok: false, error: `"${req.action}" is not available for a case in status ${run.status}.` };
+  if (!option) return { ok: false, error: `"${req.action}" is not available for a case that is ${run.status.replace("_", " ")}.` };
   if (!option.allowed) return { ok: false, error: option.blockedReason ?? "Action not allowed." };
-  if (option.needsVerification && !req.verificationConfirmed) {
-    return { ok: false, error: "Confirm that the bank change was independently verified with a trusted vendor contact." };
-  }
+  if (option.needsVerification && !req.verificationConfirmed) return { ok: false, error: "Confirm that the bank change was independently verified with the trusted contact on file." };
+  if (option.needsAuthorization && (!req.authorizedBy?.trim() || !req.reference?.trim())) return { ok: false, error: "Record who authorised the PO change and the amendment or approval reference." };
 
+  const before = openCodes(run);
   let resolved = [...(run.resolvedCodes ?? [])];
   let to: CaseStatus;
   switch (req.action) {
     case "verify_bank":
-      resolved = [...resolved, "BANK_ACCOUNT_MISMATCH"];
-      to = statusAfterResolve(run, resolved);
-      break;
     case "confirm_po":
-      resolved = [...resolved, "PO_MATCH_UNCONFIRMED"];
-      to = statusAfterResolve(run, resolved);
-      break;
     case "confirm_fields":
-      resolved = [...resolved, "HANDWRITTEN_DOCUMENT", "LOW_EXTRACTION_CONFIDENCE"];
-      to = statusAfterResolve(run, resolved);
+    case "resolve_po":
+      resolved = [...new Set([...resolved, ...(option.resolves ?? [])])];
+      to = statusFromOpen(run, resolved);
       break;
     case "approve":
-      resolved = [...new Set([...resolved, ...openCodes(run)])];
+      resolved = [...new Set([...resolved, ...(option.resolves ?? [])])];
       to = "approved";
       break;
     case "request_info":
@@ -135,6 +146,18 @@ export function applyReviewAction(run: RunRecord, req: ReviewRequest, now = Date
       to = "rejected";
       break;
   }
-  const event: AuditEvent = { at: now, actor: reviewer, kind: "reviewer", action: ACTION_TEXT[req.action], fromStatus: run.status, toStatus: to, note: justification };
+  const remaining = run.findings.filter((f) => f.action !== "info" && !resolved.includes(f.code)).map((f) => f.code);
+  const event: AuditEvent = {
+    at: now,
+    actor: reviewer,
+    kind: "reviewer",
+    action: ACTION_TEXT[req.action],
+    fromStatus: run.status,
+    toStatus: to,
+    note: justification,
+    resolved: before.filter((c) => resolved.includes(c)),
+    remaining: to === "approved" || to === "rejected" ? [] : [...new Set(remaining)],
+    reference: req.action === "resolve_po" ? `Authorised by ${req.authorizedBy!.trim()} · ref ${req.reference!.trim()}` : undefined,
+  };
   return { ok: true, run: { ...run, status: to, resolvedCodes: resolved, audit: [...run.audit, event] } };
 }

@@ -194,6 +194,9 @@ export interface AuditEvent {
   fromStatus?: CaseStatus;
   toStatus: CaseStatus;
   note?: string;
+  resolved?: ExceptionCode[]; // findings this action resolved
+  remaining?: ExceptionCode[]; // findings still open afterwards
+  reference?: string; // e.g. PO amendment reference and authoriser
 }
 
 export interface DuplicateRef {

@@ -113,6 +113,8 @@ export function applyCorrections(run: RunRecord, req: CorrectionRequest, others:
     fromStatus: run.status,
     toStatus: status,
     note: reason,
+    resolved: (run.findings.filter((f) => f.action !== "info").map((f) => f.code) as ExceptionCode[]).filter((c) => !findings.some((f) => f.code === c && f.action !== "info")),
+    remaining: [...new Set(findings.filter((f) => f.action !== "info" && !keep.includes(f.code)).map((f) => f.code))],
   };
   const explanation = templateExplanation(next, pm.poMatch, findings, decision);
   explanation.summary = `Re-validated after reviewer correction. ${explanation.summary}`;

@@ -7,7 +7,8 @@ import { SAMPLES, type Sample } from "../data/samples";
 import { ERP_LEDGER, VENDORS } from "../data/vendors";
 import { DocumentViewer, Investigation } from "../investigation";
 import { prepareDocument, type PreparedDocument } from "../lib/document";
-import { buildLedger, isOpen, money } from "../lib/engine";
+import { buildLedger, money } from "../lib/engine";
+import { openCases } from "../lib/analytics";
 import { checkHealth } from "../lib/llm";
 import { STAGES, runPipeline } from "../lib/pipeline";
 import { loadRules } from "../lib/rules";
@@ -17,7 +18,22 @@ import { Shell } from "../Shell";
 import type { Invoice, RunRecord, StageState } from "../types";
 import { StatusBadge, resolutionToStatus, useRuns, useToast } from "../ui";
 
-const KIND_ICON = { "Digital PDF": FileText, "Scanned PDF": ScanLine, "Handwritten photo": PenLine };
+// Technical failures are never business decisions: nothing is saved, no
+// fields are invented, and the same document can be retried.
+function classifyError(msg: string): { title: string; body: string; tone: "warn" | "err" } {
+  if (/\b(503|429|500|502|504)\b|high demand|UNAVAILABLE|RESOURCE_EXHAUSTED|rate.?limit|Failed to fetch|network/i.test(msg)) {
+    return { tone: "warn", title: "AI service temporarily unavailable", body: "The extraction service is busy or unreachable (it already retried with backup models). No decision was made and nothing was saved. Your document is still loaded, so you can retry." };
+  }
+  if (/JSON|parse|Empty|not configured/i.test(msg)) {
+    return { tone: "err", title: "Extraction failed", body: "The document couldn't be read into structured fields. No decision was made and nothing was saved. Retry, or check the file is a readable invoice." };
+  }
+  if (/not saved/i.test(msg)) {
+    return { tone: "err", title: "Decision computed but not saved", body: "The checks ran but the record couldn't be stored. Retry to process and save it again." };
+  }
+  return { tone: "err", title: "System error, not a business rule", body: "Processing stopped for a technical reason. No decision was made." };
+}
+
+const KIND_ICON ={ "Digital PDF": FileText, "Scanned PDF": ScanLine, "Handwritten photo": PenLine };
 
 export default function Process() {
   const { runs, setRuns, replace } = useRuns();
@@ -100,7 +116,7 @@ export default function Process() {
     }
   }, [doc, runs, setRuns]);
 
-  const openCount = runs.filter((r) => isOpen(r.status)).length;
+  const openCount = openCases(runs).length;
   const phase: "intake" | "running" | "done" = saved ? "done" : running || stages.length ? "running" : "intake";
 
   // ---------- C: decision ready ----------
@@ -174,19 +190,27 @@ export default function Process() {
               )}
             </div>
             <Timeline stages={stages} live={running} />
-            {error && (
-              <div className="alert alert-err" role="alert">
-                <b>System error, not a business rule.</b> {error}
-                <div className="actions" style={{ marginTop: 10 }}>
-                  <button className="btn btn-primary btn-sm" onClick={run}>
-                    Try again
-                  </button>
-                  <button className="btn btn-sm" onClick={reset}>
-                    Back
-                  </button>
+            {error && (() => {
+              const kind = classifyError(error);
+              return (
+                <div className={`sys-err sys-${kind.tone}`} role="alert">
+                  <div className="sys-title">{kind.title}</div>
+                  <p>{kind.body}</p>
+                  <details>
+                    <summary>Technical detail</summary>
+                    <code>{error.slice(0, 400)}</code>
+                  </details>
+                  <div className="actions" style={{ marginTop: 12 }}>
+                    <button className="btn btn-primary btn-sm" onClick={run}>
+                      <RotateCcw size={14} /> Retry with the same document
+                    </button>
+                    <button className="btn btn-sm" onClick={reset}>
+                      Back
+                    </button>
+                  </div>
                 </div>
-              </div>
-            )}
+              );
+            })()}
           </section>
         </div>
       </Shell>

@@ -3,14 +3,14 @@
 // workspace without the document pane (document opens in a viewer instead).
 
 import { useMemo, useState, type ReactNode } from "react";
-import { Ban, BadgeCheck, Check, ClipboardCheck, ExternalLink, FileSearch, Landmark, MessageSquareText, PauseCircle, PencilLine, ShieldCheck, ZoomIn, ZoomOut } from "lucide-react";
+import { Ban, BadgeCheck, Check, ClipboardCheck, ExternalLink, FileSearch, History, Landmark, MessageSquareText, PauseCircle, PencilLine, ShieldCheck, ZoomIn, ZoomOut } from "lucide-react";
 import { ACTION_GROUPS, REASON_LABEL, SHORT, nextStep, requiredAction } from "./copy";
 import { PURCHASE_ORDERS } from "./data/purchaseOrders";
 import { ERP_LEDGER, VENDORS } from "./data/vendors";
 import { EvidenceStack } from "./evidence";
 import { buildLedger, expectedTotal, isOpen, money, statusLabel, suggestPos } from "./lib/engine";
 import { DEFAULT_RULES } from "./lib/rules";
-import { availableActions, openCodes, type ActionOption, type ReviewActionId } from "./lib/review";
+import { NEEDS_CORRECTION, availableActions, openCodes, type ActionOption, type ReviewActionId } from "./lib/review";
 import { submitCorrection, submitReview } from "./lib/runsApi";
 import { AuditTrail, Findings, Timeline, VendorComms, decidedBy } from "./runView";
 import type { Invoice, RunRecord, StageId } from "./types";
@@ -326,9 +326,10 @@ function PoSuggestions({ run, allRuns, onUse }: { run: RunRecord; allRuns: RunRe
 // ---------------- Guided actions ----------------
 
 const ACTION_META: Record<ReviewActionId, { icon: typeof Check; help: string }> = {
-  verify_bank: { icon: Landmark, help: "Record that you called the vendor on the number in the vendor master and they confirmed the new account. This clears the security hold; approval is a separate step." },
-  confirm_po: { icon: ClipboardCheck, help: "Record that the PO owner confirmed this invoice belongs to the suggested PO." },
-  confirm_fields: { icon: BadgeCheck, help: "Record that you checked every extracted figure against the original document." },
+  verify_bank: { icon: Landmark, help: "Record that you called the vendor on the number in the vendor master and they confirmed the new account. This clears only the security hold; any other open finding stays open." },
+  confirm_po: { icon: ClipboardCheck, help: "Record that the PO owner confirmed this invoice belongs to the suggested PO. Other findings stay open." },
+  confirm_fields: { icon: BadgeCheck, help: "Record that you checked every extracted figure against the original document. This does not approve the invoice; correct any wrong value with “Correct extracted fields” first." },
+  resolve_po: { icon: ClipboardCheck, help: "Record an authorised PO amendment or approval for the discrepancy below. The PO record itself isn't changed here. If the vendor sends a corrected invoice instead, use “Correct extracted fields” and every rule re-runs." },
   approve: { icon: ShieldCheck, help: "Approve for the next payment run. Only possible once every mandatory control is resolved. Approval is not payment." },
   request_info: { icon: MessageSquareText, help: "Mark the invoice as waiting on the vendor. Use the draft email in Detailed view." },
   keep_on_hold: { icon: PauseCircle, help: "Keep the payment hold in place and record why." },
@@ -341,9 +342,23 @@ function GuidedActions({ run, onUpdated, onError, onCorrect }: { run: RunRecord;
   const [reviewer, setReviewer] = useReviewer();
   const [note, setNote] = useState("");
   const [verified, setVerified] = useState(false);
+  const [authorizedBy, setAuthorizedBy] = useState("");
+  const [reference, setReference] = useState("");
   const [busy, setBusy] = useState(false);
   const [touched, setTouched] = useState(false);
   const vendor = VENDORS.find((v) => v.id === run.vendorId);
+  const open = openCodes(run);
+  const needsCorrection = open.some((c) => NEEDS_CORRECTION.includes(c));
+  const recommended: ReviewActionId | "correct" | null = (() => {
+    const k = requiredAction(run, open);
+    if (k === "bank") return "verify_bank";
+    if (k === "onboard") return "request_info";
+    if (needsCorrection) return "correct";
+    if (k === "fields") return "confirm_fields";
+    if (k === "po") return "confirm_po";
+    if (k === "po_amount") return "resolve_po";
+    return "approve";
+  })();
 
   if (!options.length) {
     const last = [...run.audit].reverse().find((e) => e.kind === "reviewer");
@@ -357,18 +372,29 @@ function GuidedActions({ run, onUpdated, onError, onCorrect }: { run: RunRecord;
     );
   }
   const opt = options.find((o) => o.id === active);
-  const errors = touched ? [!reviewer.trim() && "Enter your name.", note.trim().length < 5 && "Add a short justification (5+ characters).", opt?.needsVerification && !verified && "Confirm the independent call-back."].filter(Boolean) : [];
+  const errors = touched
+    ? [
+        !reviewer.trim() && "Enter your name.",
+        note.trim().length < 5 && "Add a short justification (5+ characters).",
+        opt?.needsVerification && !verified && "Confirm the independent call-back.",
+        opt?.needsAuthorization && !authorizedBy.trim() && "Enter who authorised the PO change.",
+        opt?.needsAuthorization && !reference.trim() && "Enter the amendment or approval reference.",
+      ].filter(Boolean)
+    : [];
   const submit = async (o: ActionOption) => {
     setTouched(true);
-    if (!reviewer.trim() || note.trim().length < 5 || (o.needsVerification && !verified)) return;
+    if (!reviewer.trim() || note.trim().length < 5 || (o.needsVerification && !verified) || (o.needsAuthorization && (!authorizedBy.trim() || !reference.trim()))) return;
     setBusy(true);
     try {
-      const r = await submitReview(run.id, { action: o.id, reviewer, justification: note, verificationConfirmed: verified });
+      const r = await submitReview(run.id, { action: o.id, reviewer, justification: note, verificationConfirmed: verified, authorizedBy, reference });
       setActive(null);
       setNote("");
       setVerified(false);
+      setAuthorizedBy("");
+      setReference("");
       setTouched(false);
-      onUpdated(r, `${o.label} · recorded. Now ${statusLabel(r.status)}.`);
+      const still = openCodes(r).length;
+      onUpdated(r, `${o.label} · recorded. Now ${statusLabel(r.status)}${still && r.status !== "approved" && r.status !== "rejected" ? ` · ${still} finding${still > 1 ? "s" : ""} still open` : ""}.`);
     } catch (e) {
       onError((e as Error).message);
     } finally {
@@ -380,10 +406,10 @@ function GuidedActions({ run, onUpdated, onError, onCorrect }: { run: RunRecord;
   const card = (o: ActionOption) => {
     const I = ACTION_META[o.id].icon;
     return (
-      <button key={o.id} className={`act ${active === o.id ? "on" : ""} ${o.tone === "danger" ? "act-danger" : ""}`} disabled={!o.allowed} aria-pressed={active === o.id} onClick={() => (setActive(active === o.id ? null : o.id), setTouched(false))} title={o.blockedReason}>
+      <button key={o.id} className={`act ${active === o.id ? "on" : ""} ${o.tone === "danger" ? "act-danger" : ""} ${recommended === o.id ? "act-rec" : ""}`} disabled={!o.allowed} aria-pressed={active === o.id} onClick={() => (setActive(active === o.id ? null : o.id), setTouched(false))} title={o.blockedReason}>
         <I size={18} aria-hidden />
         <span className="act-label">{o.label}</span>
-        {!o.allowed && <span className="act-lock">Locked</span>}
+        {!o.allowed ? <span className="act-lock">Locked</span> : recommended === o.id ? <span className="act-tag">Recommended</span> : null}
       </button>
     );
   };
@@ -396,9 +422,10 @@ function GuidedActions({ run, onUpdated, onError, onCorrect }: { run: RunRecord;
       <div className="acts">
         {primary.map(card)}
         {isOpen(run.status) && (
-          <button className="act" onClick={onCorrect}>
+          <button className={`act ${recommended === "correct" ? "act-rec" : ""}`} onClick={onCorrect}>
             <PencilLine size={18} aria-hidden />
             <span className="act-label">Correct extracted fields</span>
+            {recommended === "correct" && <span className="act-tag">Recommended</span>}
           </button>
         )}
       </div>
@@ -413,6 +440,29 @@ function GuidedActions({ run, onUpdated, onError, onCorrect }: { run: RunRecord;
       {opt && opt.allowed && (
         <div className="act-form" role="region" aria-label={opt.label}>
           <p className="act-help">{ACTION_META[opt.id].help}</p>
+          {opt.id === "resolve_po" && run.poMatch.billing && (
+            <div className="po-gap">
+              {(run.poMatch.lines ?? [])
+                .filter((l) => l.status !== "ok")
+                .map((l, i) => (
+                  <div key={i}>
+                    <b>{l.description}</b>: ordered {l.poQty ?? "—"}, previously billed {l.priorQty}, this invoice {l.invoiceQty}
+                    {l.poQty !== null && l.priorQty + l.invoiceQty > l.poQty ? <span className="t-bad"> → {l.priorQty + l.invoiceQty - l.poQty} over</span> : null}
+                    {l.status === "price_over" && l.poUnitPrice !== null && <span className="t-bad"> · price {money(l.invoiceUnitPrice, run.invoice.currency)} vs {money(l.poUnitPrice, run.invoice.currency)}</span>}
+                  </div>
+                ))}
+              <div>
+                Value: {money(run.poMatch.billing.billedAfter, run.invoice.currency)} billed against a {money(run.poMatch.billing.poTotal, run.invoice.currency)} PO
+                {run.poMatch.billing.billedAfter > run.poMatch.billing.poTotal && <span className="t-bad"> → {money(run.poMatch.billing.billedAfter - run.poMatch.billing.poTotal, run.invoice.currency)} over</span>}
+              </div>
+            </div>
+          )}
+          {opt.needsAuthorization && (
+            <div className="form-row">
+              <input className="input" aria-label="Authorised by" placeholder={`Authorised by (PO owner: ${run.poMatch.po?.approvedBy ?? "—"})`} value={authorizedBy} onChange={(e) => setAuthorizedBy(e.target.value)} />
+              <input className="input" aria-label="Amendment reference" placeholder="PO amendment / approval reference" value={reference} onChange={(e) => setReference(e.target.value)} />
+            </div>
+          )}
           {opt.needsVerification && (
             <label className="verify">
               <input type="checkbox" checked={verified} onChange={(e) => setVerified(e.target.checked)} />
@@ -487,6 +537,7 @@ export function Investigation({
   onUpdated,
   notify,
   headerExtra,
+  onViewDocument,
 }: {
   run: RunRecord;
   allRuns: RunRecord[];
@@ -496,6 +547,7 @@ export function Investigation({
   onUpdated: (r: RunRecord) => void;
   notify: (m: string, kind?: "ok" | "err") => void;
   headerExtra?: ReactNode;
+  onViewDocument?: () => void; // queue: open the document in a side-by-side split instead of a modal
 }) {
   const [density, setDensity] = useDensity();
   const detailed = density === "detailed";
@@ -605,9 +657,9 @@ export function Investigation({
         </section>
       )}
 
-      {detailed && (
-        <>
-          <section className="sec">
+      <section className="sec">
+        {detailed && (
+          <>
             <details className="acc-item">
               <summary>
                 <span className="acc-title">Vendor communication</span>
@@ -624,17 +676,18 @@ export function Investigation({
                 <Timeline stages={run.stages} compact />
               </div>
             </details>
-            <details className="acc-item" open>
-              <summary>
-                <span className="acc-title">Audit history · {run.audit.length + 1} events</span>
-              </summary>
-              <div className="acc-body">
-                <AuditTrail run={run} />
-              </div>
-            </details>
-          </section>
-        </>
-      )}
+          </>
+        )}
+        <details className="acc-item" open={detailed || run.audit.some((e) => e.kind === "reviewer")}>
+          <summary>
+            <History size={16} aria-hidden />
+            <span className="acc-title">Audit history · {3 + run.audit.filter((e) => e.kind === "reviewer").length} events</span>
+          </summary>
+          <div className="acc-body">
+            <AuditTrail run={run} />
+          </div>
+        </details>
+      </section>
     </div>
   );
 
@@ -663,7 +716,7 @@ export function Investigation({
         </div>
         {embedded && (
           <div className="inv-tools">
-            <button className="btn btn-sm" onClick={() => setDocOpen(true)}>
+            <button className="btn btn-sm" onClick={() => (onViewDocument ? onViewDocument() : setDocOpen(true))}>
               <FileSearch size={14} /> View original document
             </button>
             <a className="btn btn-sm btn-ghost" href={`/invoice/${run.id}?from=queue`}>

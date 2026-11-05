@@ -3,7 +3,7 @@
 
 import { useState } from "react";
 import { Check, ChevronDown, Copy, Loader2, OctagonPause, TriangleAlert, X } from "lucide-react";
-import { SHORT, whyItMatters } from "./copy";
+import { REASON_LABEL, SHORT, whyItMatters } from "./copy";
 import { statusLabel } from "./lib/engine";
 import { STAGES } from "./lib/pipeline";
 import type { CaseStatus, Explanation, Finding, RunRecord, StageState } from "./types";
@@ -151,31 +151,68 @@ export function VendorComms({ explanation, status }: { explanation: Explanation;
 
 // ---------------- Audit ----------------
 
+// Chronological timeline built only from stored records: the processing
+// attempt (upload, extraction, validation, decision) then every human action
+// with what it resolved and what is still open.
 export function AuditTrail({ run }: { run: RunRecord }) {
+  const st = (id: string) => run.stages.find((s) => s.id === id);
+  const extract = st("extract");
+  const decide = st("decide");
+  const label = (c: string) => REASON_LABEL[c as keyof typeof REASON_LABEL] ?? c;
+  const sys = run.audit.find((e) => e.kind === "system");
+  const t = (ms?: number) => (ms ? new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "");
   return (
     <ol className="audit">
       <li>
         <span className="audit-dot" />
         <div>
-          <div className="audit-what">Uploaded {run.fileName}</div>
+          <div className="audit-what">Document uploaded</div>
           <div className="audit-meta">
-            {fmtDate(run.createdAt)} · {run.extractionMethod} · {run.model} · decided in {fmtSecs(run.durationMs)}
+            {fmtDate(run.createdAt)} · {run.fileName} · fingerprint {run.fileHash.slice(0, 10)}… · attempt {run.id}
           </div>
         </div>
       </li>
-      {run.audit.map((e, i) => (
-        <li key={i} className={e.kind === "reviewer" ? "audit-rev" : ""}>
+      {extract?.endedAt && (
+        <li className="audit-ai">
           <span className="audit-dot" />
           <div>
-            <div className="audit-what">{e.action}</div>
+            <div className="audit-what">AI extraction completed</div>
             <div className="audit-meta">
-              {e.actor} · {fmtDate(e.at)} · {e.fromStatus ? `${statusLabel(e.fromStatus)} → ` : ""}
-              {statusLabel(e.toStatus)}
+              {t(extract.endedAt)} · {run.extractionMethod} · {run.model}
+              {(run.originalInvoice ?? run.invoice).lowConfidenceFields.length ? ` · AI flagged: ${(run.originalInvoice ?? run.invoice).lowConfidenceFields.join(", ")}` : ""}
             </div>
-            {e.note && <div className="audit-note">“{e.note}”</div>}
           </div>
         </li>
-      ))}
+      )}
+      {decide?.endedAt && (
+        <li>
+          <span className="audit-dot" />
+          <div>
+            <div className="audit-what">Validation completed · {sys?.action.replace("Automated decision: ", "") ?? run.decision.headline}</div>
+            <div className="audit-meta">
+              {t(decide.endedAt)} · rules engine · {run.decision.decidingCodes.length ? run.decision.decidingCodes.map(label).join(", ") : "no blocking findings"} · policy: PO tolerance {((run.rules?.amountTolerancePct ?? 0.02) * 100).toFixed(2)}%
+            </div>
+          </div>
+        </li>
+      )}
+      {run.audit
+        .filter((e) => e.kind === "reviewer")
+        .map((e, i) => (
+          <li key={i} className="audit-rev">
+            <span className="audit-dot" />
+            <div>
+              <div className="audit-what">{e.action}</div>
+              <div className="audit-meta">
+                {e.actor} <span className="demo-id">demo identity</span> · {fmtDate(e.at)} · {e.fromStatus ? `${statusLabel(e.fromStatus)} → ` : ""}
+                {statusLabel(e.toStatus)}
+              </div>
+              {e.note && <div className="audit-note">“{e.note}”</div>}
+              {e.reference && <div className="audit-line">{e.reference}</div>}
+              {e.resolved && e.resolved.length > 0 && <div className="audit-line t-ok">Resolved: {e.resolved.map(label).join(", ")}</div>}
+              {e.remaining && e.remaining.length > 0 && <div className="audit-line t-warn">Still open: {e.remaining.map(label).join(", ")}</div>}
+            </div>
+          </li>
+        ))}
     </ol>
   );
 }

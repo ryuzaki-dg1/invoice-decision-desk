@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { ChevronDown, Lock, RotateCcw, Save } from "lucide-react";
 import { REASON_LABEL } from "../copy";
-import { isOpen } from "../lib/engine";
+import { openCases } from "../lib/analytics";
 import { evaluate } from "../lib/revalidate";
 import { DEFAULT_RULES, loadRules, saveRules, type Rules } from "../lib/rules";
 import { Shell } from "../Shell";
@@ -91,7 +91,7 @@ export default function Policy() {
   );
 
   return (
-    <Shell page="policy" openCount={runs.filter((r) => isOpen(r.status)).length}>
+    <Shell page="policy" openCount={openCases(runs).length}>
       <header className="page-head">
         <div>
           <h1 className="h1">Policy rules</h1>

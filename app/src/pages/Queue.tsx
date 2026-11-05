@@ -1,10 +1,11 @@
-// Review workspace: compact list of invoices needing action (30%) and the
-// selected invoice's decision, evidence and guided resolution (70%).
+// Review workspace: queue (30%) + investigation (70%), each scrolling on its
+// own. "View document" swaps the queue column for the original invoice so it
+// sits side by side with the evidence, without leaving the workspace.
 
 import { useEffect, useMemo, useState } from "react";
-import { CircleCheckBig, Inbox } from "lucide-react";
+import { ArrowLeft, CircleCheckBig, Inbox } from "lucide-react";
 import { ACTION_GROUPS } from "../copy";
-import { Investigation } from "../investigation";
+import { DocumentViewer, Investigation } from "../investigation";
 import { money } from "../lib/engine";
 import { Shell } from "../Shell";
 import { AttentionRow, prioritise } from "../tables";
@@ -14,6 +15,7 @@ export default function Queue() {
   const { runs, loaded, replace } = useRuns();
   const [toast, notify] = useToast();
   const [filter, setFilter] = useState<string>("all");
+  const [docOpen, setDocOpen] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(() => new URLSearchParams(window.location.search).get("run"));
   const queue = useMemo(() => prioritise(runs), [runs]);
   const groups = ACTION_GROUPS.map((g) => ({ ...g, n: queue.filter((q) => q.actionKey === g.key).length })).filter((g) => g.n > 0);
@@ -23,46 +25,65 @@ export default function Queue() {
   }, [loaded, selectedId, shown]);
   const selected = runs.find((r) => r.id === selectedId) ?? null;
   const value = queue.reduce((s, r) => s + (r.invoice.total ?? 0), 0);
+  const select = (id: string) => {
+    setSelectedId(id);
+    window.history.replaceState(null, "", `/queue?run=${id}`);
+  };
 
   return (
     <Shell page="queue" openCount={queue.length} wide>
-      <div className="ws">
-        <aside className="ws-list card" aria-label="Invoices requiring action">
-          <div className="ws-head">
-            <h1 className="h2">Review queue</h1>
-            <p className="muted small">
-              {queue.length} open · {money(value)} waiting
-            </p>
-          </div>
-          {groups.length > 0 && (
-            <div className="chips chips-wrap" role="group" aria-label="Filter by action">
-              <button className={`chip ${filter === "all" ? "on" : ""}`} aria-pressed={filter === "all"} onClick={() => setFilter("all")}>
-                All <span>{queue.length}</span>
-              </button>
-              {groups.map((g) => (
-                <button key={g.key} className={`chip ${filter === g.key ? "on" : ""}`} aria-pressed={filter === g.key} onClick={() => setFilter(g.key)} title={g.hint}>
-                  {g.label} <span>{g.n}</span>
-                </button>
-              ))}
+      <div className={`ws ${docOpen ? "ws-doc" : ""}`}>
+        {docOpen && selected ? (
+          <aside className="ws-left">
+            <button className="btn btn-sm ws-back" onClick={() => setDocOpen(false)}>
+              <ArrowLeft size={14} /> Back to queue
+            </button>
+            <DocumentViewer
+              src={selected.hasPreview ? `/api/runs/${selected.id}/preview` : null}
+              href={selected.hasPreview ? `/api/runs/${selected.id}/preview` : undefined}
+              title={selected.fileName}
+              meta={`${selected.pageCount} page${selected.pageCount > 1 ? "s" : ""} · ${selected.invoice.documentType}`}
+              sticky={false}
+            />
+          </aside>
+        ) : (
+          <aside className="ws-left ws-list card" aria-label="Invoices requiring action">
+            <div className="ws-head">
+              <h1 className="h2">Review queue</h1>
+              <p className="muted small">
+                {queue.length} open invoice{queue.length === 1 ? "" : "s"} · {money(value)} waiting
+              </p>
             </div>
-          )}
-          <div className="ws-items">
-            {!loaded ? (
-              <SkeletonRows />
-            ) : shown.length === 0 ? (
-              <Empty icon={<CircleCheckBig size={22} />} title={queue.length ? "Nothing in this filter" : "Queue is clear"}>
-                {queue.length ? "Choose another filter." : <a href="/process">Process an invoice</a>}
-              </Empty>
-            ) : (
-              shown.map((r) => <AttentionRow key={r.id} r={r} compact selected={r.id === selectedId} onOpen={() => setSelectedId(r.id)} />)
+            {groups.length > 0 && (
+              <div className="chips chips-wrap" role="group" aria-label="Filter by action">
+                <button className={`chip ${filter === "all" ? "on" : ""}`} aria-pressed={filter === "all"} onClick={() => setFilter("all")}>
+                  All <span>{queue.length}</span>
+                </button>
+                {groups.map((g) => (
+                  <button key={g.key} className={`chip ${filter === g.key ? "on" : ""}`} aria-pressed={filter === g.key} onClick={() => setFilter(g.key)} title={g.hint}>
+                    {g.label} <span>{g.n}</span>
+                  </button>
+                ))}
+              </div>
             )}
-          </div>
-          <p className="ws-foot muted small">Ordered by severity, then amount, then waiting time.</p>
-        </aside>
+            <div className="ws-items" role="listbox" aria-label="Open invoices">
+              {!loaded ? (
+                <SkeletonRows />
+              ) : shown.length === 0 ? (
+                <Empty icon={<CircleCheckBig size={22} />} title={queue.length ? "Nothing in this filter" : "Queue is clear"}>
+                  {queue.length ? "Choose another filter." : <a href="/process">Process an invoice</a>}
+                </Empty>
+              ) : (
+                shown.map((r) => <AttentionRow key={r.id} r={r} compact selected={r.id === selectedId} onOpen={() => select(r.id)} />)
+              )}
+            </div>
+            <p className="ws-foot muted small">Ordered by severity, then amount, then waiting time.</p>
+          </aside>
+        )}
         <section className="ws-detail" aria-live="polite">
           {selected ? (
             <div className="card ws-card">
-              <Investigation key={selected.id} run={selected} allRuns={runs} embedded onUpdated={replace} notify={notify} />
+              <Investigation key={selected.id} run={selected} allRuns={runs} embedded onUpdated={replace} notify={notify} onViewDocument={() => setDocOpen((v) => !v)} />
             </div>
           ) : (
             <div className="card">

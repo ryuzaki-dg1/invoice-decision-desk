@@ -30,14 +30,27 @@ Key rules:
 - **Duplicates:** conservative invoice-number normalisation (case, spaces, punctuation, a leading "INV"/"Invoice No" label, leading zeros), scoped to the same vendor. Same amount with a different number is only a *possible* duplicate. A byte-identical re-upload is recorded as a repeat submission and never adds a payable.
 - **Approved ≠ paid:** "paid" is only said when the ERP history has a payment record (seeded demo data). Invoices approved here are "approved for payment, not yet paid".
 
+## Metrics (one shared analytics layer: `src/lib/analytics.ts`)
+
+- **Processing attempts:** every pipeline run, including repeat uploads.
+- **Unique invoices:** grouped by matched vendor + normalised invoice number when both are known, otherwise by file hash; never by amount. Repeat attempts stay in the history, grouped under their invoice.
+- **Straight-through processing:** unique invoices auto-approved with no human action ÷ eligible unique invoices (resubmissions of invoices already on file are excluded). The UI shows the denominator, e.g. "1 of 5 eligible invoices auto-approved".
+- **Awaiting action / value requiring intervention:** unique invoices still in review, on hold or awaiting the vendor, and their total.
+- **Average time:** upload → initial automated decision (excludes the explanation step and human waiting time).
+
 ## Reviewer workflow
 
 | Open control | Required resolution |
 |---|---|
-| Bank account mismatch | "Record independent bank verification", with a checkbox confirming a call-back to the contact on file. The hold then clears to Needs review; approval is a separate step. |
-| Suggested PO | "Confirm suggested PO" before Approve is enabled |
-| Unknown vendor | Cannot be approved here; request onboarding, keep on hold, or reject |
-| Other review items | Approve with justification, request clarification, or reject |
+| Bank account mismatch | **Verify payment details**: confirm an independent call-back to the contact on file. Clears only the security hold. |
+| PO overage / quantity / price / expiry | **Resolve PO discrepancy**: record who authorised the amendment and its reference. The PO record isn't silently changed. A corrected invoice goes through "Correct extracted fields" instead. |
+| Suggested PO | **Confirm suggested PO** |
+| Handwritten / uncertain read | **Confirm extracted information**. It does not approve. |
+| Arithmetic / missing fields / no PO | **Correct extracted fields**: the server re-runs every rule |
+| Unknown vendor | Cannot be approved here: request onboarding (awaiting vendor), keep on hold, or reject |
+| Possible duplicate / above limit | Approve with justification |
+
+Every finding has a stable code, a severity, evidence and an open/resolved state. Resolving one finding recomputes the status from what remains. **Approve unlocks only when nothing material is open**, and approval is a separate, explicit step. Each reviewer event records the action, demo identity, time, justification, the findings it resolved, the findings still open, and any authorisation reference. Closed cases accept no further actions.
 
 Every status change requires a reviewer name (lightweight demo identity) and a justification, and is logged with the from/to status and timestamp. Approved and rejected cases are final.
 
@@ -92,7 +105,7 @@ npm run dev            # http://localhost:5173
 
 ## Testing
 
-- `npm test` runs 23 tests on the decision engine, review rules and correction loop: every scenario plus arithmetic, discounts, approved-vs-paid wording, repeat uploads, possible duplicates and reviewer controls. No API calls are made.
+- `npm test` runs 29 tests on the decision engine, review rules, correction loop, analytics and AI-failure handling: every scenario plus arithmetic, discounts, approved-vs-paid wording, repeat uploads, possible duplicates and reviewer controls. No API calls are made.
 - `node scripts/e2e.mjs` drives the real UI in Edge through all six invoices with the live model, then a repeat upload and the bank-verification review flow, and saves screenshots. It clears run history first. `--ui-only` reuses stored runs to save model quota.
 
 ## Deploy

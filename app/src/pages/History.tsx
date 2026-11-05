@@ -1,5 +1,5 @@
 import { RotateCcw } from "lucide-react";
-import { isOpen } from "../lib/engine";
+import { openCases } from "../lib/analytics";
 import { resetRuns } from "../lib/runsApi";
 import { Shell } from "../Shell";
 import { RunsTable } from "../tables";
@@ -9,7 +9,7 @@ export default function History() {
   const { runs, loaded, reload } = useRuns();
   const [toast, notify] = useToast();
   return (
-    <Shell page="history" openCount={runs.filter((r) => isOpen(r.status)).length}>
+    <Shell page="history" openCount={openCases(runs).length}>
       <header className="page-head">
         <div>
           <h1 className="h1">Invoice history</h1>
