@@ -1,0 +1,73 @@
+// Turns an uploaded file into what the extraction model needs: page images
+// (works for any vision model, scanned or digital) plus the PDF text layer
+// when one exists. A PDF without a text layer is a scan.
+
+import * as pdfjs from "pdfjs-dist";
+import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+
+pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
+
+const MAX_PAGES = 3;
+
+export interface PreparedDocument {
+  fileName: string;
+  mimeType: string;
+  pageImages: string[]; // data URLs (PNG/JPEG)
+  textLayer: string;
+  hasTextLayer: boolean;
+  pageCount: number;
+}
+
+function readAsDataUrl(file: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
+}
+
+export async function prepareDocument(file: File): Promise<PreparedDocument> {
+  const isPdf = file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+  if (!isPdf) {
+    if (!file.type.startsWith("image/")) throw new Error(`Unsupported file type "${file.type || file.name}". Upload a PDF or an image.`);
+    return {
+      fileName: file.name,
+      mimeType: file.type,
+      pageImages: [await readAsDataUrl(file)],
+      textLayer: "",
+      hasTextLayer: false,
+      pageCount: 1,
+    };
+  }
+
+  const pdf = await pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
+  const pages = Math.min(pdf.numPages, MAX_PAGES);
+  const images: string[] = [];
+  const texts: string[] = [];
+  for (let i = 1; i <= pages; i++) {
+    const page = await pdf.getPage(i);
+    const content = await page.getTextContent();
+    texts.push(
+      content.items
+        .map((it) => ("str" in it ? it.str + (it.hasEOL ? "\n" : " ") : ""))
+        .join("")
+        .trim(),
+    );
+    const viewport = page.getViewport({ scale: 1.6 });
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.ceil(viewport.width);
+    canvas.height = Math.ceil(viewport.height);
+    await page.render({ canvasContext: canvas.getContext("2d")!, viewport }).promise;
+    images.push(canvas.toDataURL("image/jpeg", 0.85));
+  }
+  const textLayer = texts.join("\n\n--- page break ---\n\n");
+  return {
+    fileName: file.name,
+    mimeType: "application/pdf",
+    pageImages: images,
+    textLayer,
+    hasTextLayer: textLayer.replace(/\s/g, "").length > 40,
+    pageCount: pdf.numPages,
+  };
+}

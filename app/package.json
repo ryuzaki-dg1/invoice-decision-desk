@@ -1,0 +1,40 @@
+{
+  "name": "ap-invoice-decision",
+  "private": true,
+  "version": "2.0.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22.6"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "start": "node --experimental-strip-types server/standalone.ts",
+    "lint": "eslint .",
+    "preview": "vite preview",
+    "test": "node --experimental-strip-types --test src/lib/__tests__/engine.test.ts",
+    "make-samples": "node scripts/make-samples.mjs"
+  },
+  "dependencies": {
+    "pdfjs-dist": "^4.10.38",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "undici": "^8.0.2"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.4",
+    "@types/node": "^24.12.2",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.1",
+    "eslint": "^9.39.4",
+    "eslint-plugin-react-hooks": "^7.0.1",
+    "eslint-plugin-react-refresh": "^0.5.2",
+    "globals": "^17.4.0",
+    "pdfkit": "^0.17.1",
+    "playwright-core": "^1.64.1",
+    "typescript": "~6.0.2",
+    "typescript-eslint": "^8.58.0",
+    "vite": "^8.0.4"
+  }
+}

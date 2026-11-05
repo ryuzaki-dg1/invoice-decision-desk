@@ -1,0 +1,65 @@
+:root {
+  --bg: #f4f5f7;
+  --surface: #fcfcfb;
+  --surface-2: #f6f7f9;
+  --border: #e3e5ea;
+  --border-strong: #cfd3db;
+  --ink: #1b1d22;
+  --ink-2: #4a505c;
+  --muted: #7a8190;
+  --accent: #2552e8;
+  --accent-soft: #eaf0ff;
+  --good: #0ca30c;
+  --good-text: #006300;
+  --warning: #fab219;
+  --serious: #ec835a;
+  --critical: #d03b3b;
+  --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+
+  color-scheme: light;
+  color: var(--ink);
+  background: var(--bg);
+  font: 14px/1.5 var(--sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--bg);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+h2 {
+  margin: 0 0 12px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink-2);
+  letter-spacing: 0.01em;
+}
+
+h3 {
+  margin: 22px 0 8px;
+  font-size: 13px;
+  color: var(--ink-2);
+}
+
+button {
+  font: inherit;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+a {
+  color: var(--accent);
+}
