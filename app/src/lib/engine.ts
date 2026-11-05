@@ -3,16 +3,26 @@
 // The LLM only reads the document. Every check below is plain code with an
 // explicit threshold from Rules, so the same invoice always gets the same
 // decision and every decision can point at the rule that produced it.
+//
+// Decision precedence (strictest finding wins):
+//   reject   — confirmed duplicate, blocked vendor              → Rejected
+//   escalate — bank account mismatch, unknown vendor, PO of other vendor → Payment hold
+//   review   — missing info, arithmetic, unconfirmed PO, over PO, low confidence → Needs review
+//   info     — recorded, never blocks                           → Approved if nothing else
 
 import type {
   BillingSummary,
+  CaseStatus,
   CheckAction,
   Decision,
+  DuplicateRef,
+  Evidence,
   ExceptionCode,
   Explanation,
   Finding,
   Invoice,
   LedgerInvoice,
+  LineCheck,
   LineItem,
   PoMatch,
   PurchaseOrder,
@@ -37,20 +47,25 @@ export function normalizeName(s: string): string {
     .trim();
 }
 
-// "INV-0923", "Invoice No. 923", "inv 923" all normalise to "923".
+// Conservative: ignore case, spaces, punctuation, a leading "INV"/"Invoice No"
+// label and leading zeros. "INV-0923", "Invoice No. 923" and "inv 923" match;
+// "SC-3390" and "3390" do not (different alphabetic prefix).
 export function normalizeInvoiceNumber(s: string | null | undefined): string {
   if (!s) return "";
-  let v = s.toUpperCase().replace(/[^A-Z0-9]/g, "");
-  let prev = "";
-  while (prev !== v) {
-    prev = v;
-    v = v.replace(/^(INVOICE|INV|NO|NUMBER|NUM|BILL)/, "");
-  }
-  return v.replace(/^0+(?=.)/, "");
+  return s
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "")
+    .replace(/^(INVOICE|INV)(NO|NUMBER)?(?=\d)/, "")
+    .replace(/^0+(?=.)/, "");
 }
 
 export function digitsOnly(s: string | null | undefined): string {
   return (s ?? "").replace(/\D/g, "");
+}
+
+export function maskAccount(s: string | null | undefined): string {
+  const d = digitsOnly(s);
+  return d ? `•••• ${d.slice(-4)}` : "—";
 }
 
 function tokens(s: string): Set<string> {
@@ -82,24 +97,27 @@ export function money(amount: number | null | undefined, currency = "USD"): stri
   }
 }
 
-const last4 = (s: string) => digitsOnly(s).slice(-4);
 const round2 = (n: number) => Math.round(n * 100) / 100;
+const pct = (n: number, digits = 2) => `${n >= 0 ? "+" : ""}${(n * 100).toFixed(digits)}%`;
+const signedMoney = (n: number, c: string) => `${n >= 0 ? "+" : "−"}${money(Math.abs(n), c)}`;
 
-function finding(
-  stage: StageId,
-  code: ExceptionCode,
-  action: CheckAction,
-  title: string,
-  detail: string,
-): Finding {
-  return { stage, code, action, title, detail };
+function finding(stage: StageId, code: ExceptionCode, action: CheckAction, title: string, detail: string, evidence?: Evidence[]): Finding {
+  return { stage, code, action, title, detail, evidence };
 }
 
 // ---------- Stage: validate ----------
 
+export function expectedTotal(inv: Invoice): number | null {
+  const lineSum = round2(inv.lineItems.reduce((s, li) => s + li.total, 0));
+  const base = inv.subtotal ?? (inv.lineItems.length ? lineSum : null);
+  if (base === null) return null;
+  return round2(base + (inv.tax || 0) + (inv.shipping || 0) + (inv.otherCharges || 0) - (inv.discount || 0));
+}
+
 export function validateInvoice(inv: Invoice, rules: Rules): Finding[] {
   const out: Finding[] = [];
   const tol = rules.arithmeticToleranceAbs;
+  const c = inv.currency;
 
   const missing: string[] = [];
   if (!inv.vendor) missing.push("vendor name");
@@ -108,32 +126,41 @@ export function validateInvoice(inv: Invoice, rules: Rules): Finding[] {
   if (inv.total === null || inv.total === undefined) missing.push("invoice total");
   if (missing.length) {
     out.push(
-      finding(
-        "validate",
-        "MISSING_FIELD",
-        "review",
-        `Missing ${missing.join(", ")}`,
-        `The invoice does not show: ${missing.join(", ")}. These are required to book and de-duplicate the invoice.`,
-      ),
+      finding("validate", "MISSING_FIELD", "review", `Missing ${missing.join(", ")}`, `The invoice does not show: ${missing.join(", ")}. These are required to book the invoice and check it for duplicates.`),
     );
   }
 
+  // Internal arithmetic: each check is independent of the PO, so a PO
+  // tolerance can never hide an invoice that does not add up.
   const problems: string[] = [];
+  const evidence: Evidence[] = [];
   for (const li of inv.lineItems) {
-    const expected = round2(li.quantity * li.unitPrice);
-    if (Math.abs(expected - li.total) > tol) {
-      problems.push(`"${li.description}": ${li.quantity} × ${money(li.unitPrice, inv.currency)} = ${money(expected, inv.currency)}, but line shows ${money(li.total, inv.currency)}`);
+    const exp = round2(li.quantity * li.unitPrice);
+    if (Math.abs(exp - li.total) > tol) {
+      problems.push(`"${li.description}": ${li.quantity} × ${money(li.unitPrice, c)} = ${money(exp, c)}, line shows ${money(li.total, c)}`);
     }
   }
   const lineSum = round2(inv.lineItems.reduce((s, li) => s + li.total, 0));
   if (inv.lineItems.length && inv.subtotal !== null && Math.abs(lineSum - inv.subtotal) > tol) {
-    problems.push(`line items add up to ${money(lineSum, inv.currency)}, but subtotal shows ${money(inv.subtotal, inv.currency)}`);
+    problems.push(`line items sum to ${money(lineSum, c)}, subtotal shows ${money(inv.subtotal, c)}`);
   }
-  const base = inv.subtotal ?? (inv.lineItems.length ? lineSum : null);
-  if (base !== null && inv.total !== null) {
-    const expectedTotal = round2(base + (inv.tax || 0) + (inv.shipping || 0));
-    if (Math.abs(expectedTotal - inv.total) > tol) {
-      problems.push(`subtotal + tax + shipping = ${money(expectedTotal, inv.currency)}, but total shows ${money(inv.total, inv.currency)}`);
+  const exp = expectedTotal(inv);
+  if (exp !== null && inv.total !== null) {
+    evidence.push(
+      { label: "Subtotal", value: money(inv.subtotal ?? lineSum, c) },
+      { label: "Tax", value: money(inv.tax, c) },
+      ...(inv.shipping ? [{ label: "Freight / shipping", value: money(inv.shipping, c) }] : []),
+      ...(inv.otherCharges ? [{ label: "Other charges", value: money(inv.otherCharges, c) }] : []),
+      ...(inv.discount ? [{ label: "Discount", value: `−${money(inv.discount, c)}` }] : []),
+      { label: "Expected total", value: money(exp, c) },
+      { label: "Invoice total", value: money(inv.total, c) },
+    );
+    const diff = round2(inv.total - exp);
+    if (Math.abs(diff) > tol) {
+      problems.push(`expected total ${money(exp, c)} but invoice shows ${money(inv.total, c)} (difference ${signedMoney(diff, c)})`);
+      evidence.push({ label: "Difference", value: signedMoney(diff, c), tone: "bad" });
+    } else {
+      evidence.push({ label: "Difference", value: `${signedMoney(diff, c)} (within ${money(tol, c)} rounding)`, tone: "good" });
     }
   }
   if (problems.length) {
@@ -142,51 +169,36 @@ export function validateInvoice(inv: Invoice, rules: Rules): Finding[] {
         "validate",
         "ARITHMETIC_MISMATCH",
         "review",
-        "Invoice arithmetic does not reconcile",
-        `${problems.join("; ")}. Either the vendor made an error or a figure was misread.`,
+        "Invoice does not add up",
+        `${problems.join("; ")}. Either the vendor made an error or a figure was misread. PO tolerance does not apply to internal arithmetic.`,
+        evidence,
       ),
     );
   }
 
   if (inv.documentType === "handwritten" && rules.reviewHandwritten) {
     out.push(
-      finding(
-        "validate",
-        "HANDWRITTEN_DOCUMENT",
-        "review",
-        "Handwritten invoice",
-        "Policy: handwritten invoices are never auto-approved. A reviewer should confirm the figures against the original.",
-      ),
+      finding("validate", "HANDWRITTEN_DOCUMENT", "review", "Handwritten invoice", "Policy: handwritten invoices are never auto-approved. A reviewer confirms the figures against the original."),
     );
   } else if (inv.documentType !== "digital") {
-    out.push(
-      finding(
-        "validate",
-        "LOW_CONFIDENCE_READ",
-        "info",
-        `${inv.documentType === "scanned" ? "Scanned" : "Handwritten"} document`,
-        "No text layer: fields were read visually from the page image.",
-      ),
-    );
+    out.push(finding("validate", "SCANNED_DOCUMENT", "info", "Scanned document", "No text layer; fields were read visually from the page image."));
   }
 
-  const critical = ["total", "invoiceNumber", "bankAccount", "poReference", "lineItems", "subtotal", "tax"];
+  const critical = ["total", "invoiceNumber", "bankAccount", "poReference", "lineItems", "subtotal", "tax", "shipping", "discount"];
   const unsure = inv.lowConfidenceFields ?? [];
-  const criticalUnsure = unsure.filter((f) => critical.some((c) => f.toLowerCase().startsWith(c.toLowerCase())));
+  const criticalUnsure = unsure.filter((f) => critical.some((k) => f.toLowerCase().startsWith(k.toLowerCase())));
   if (criticalUnsure.length) {
     out.push(
       finding(
         "validate",
-        "LOW_CONFIDENCE_READ",
+        "LOW_EXTRACTION_CONFIDENCE",
         "review",
-        "Some figures could not be read with confidence",
-        `Uncertain fields: ${criticalUnsure.join(", ")}. Confirm against the original before paying.`,
+        "Some figures could not be read with certainty",
+        `The model flagged these fields as uncertain: ${criticalUnsure.join(", ")}. Confirm them against the original document. (Model self-report, not a calibrated score.)`,
       ),
     );
   } else if (unsure.length) {
-    out.push(
-      finding("validate", "LOW_CONFIDENCE_READ", "info", "Minor fields read with low confidence", `Uncertain: ${unsure.join(", ")} (not used for the decision).`),
-    );
+    out.push(finding("validate", "LOW_EXTRACTION_CONFIDENCE", "info", "Minor fields uncertain", `Model flagged: ${unsure.join(", ")} (not used for the decision).`));
   }
   return out;
 }
@@ -216,21 +228,24 @@ export function checkVendor(inv: Invoice, vendors: Vendor[]): { vendor: Vendor |
     findings.push(
       finding(
         "vendor",
-        "VENDOR_NOT_IN_MASTER",
+        "UNKNOWN_VENDOR",
         "escalate",
         "Vendor is not in the approved vendor master",
-        `"${inv.vendor}" does not match any approved vendor or known alias. No payment can be made until procurement onboards and verifies this vendor.`,
+        `"${inv.vendor}" does not match any approved vendor or known alias. Nothing can be paid until procurement onboards and verifies this vendor (legal entity, tax ID, bank letter).`,
+        [
+          { label: "Name on invoice", value: inv.vendor || "—", tone: "bad" },
+          { label: "Vendor master", value: `No match among ${vendors.length} approved vendors` },
+          { label: "Bank account on invoice", value: maskAccount(inv.bankAccount) },
+        ],
       ),
     );
     lines.push(`"${inv.vendor}" not found among ${vendors.length} approved vendors`);
     return { vendor: null, findings, lines };
   }
   const v = hit.vendor;
-  lines.push(`Matched vendor master ${v.id} · ${v.name} (${hit.how} match)`);
+  lines.push(`Matched ${v.id} · ${v.name} (${hit.how} match)`);
   if (hit.how !== "exact") {
-    findings.push(
-      finding("vendor", "VENDOR_NAME_VARIANT", "info", "Vendor name variant", `Printed as "${inv.vendor}", matched to master record "${v.name}" (${hit.how}).`),
-    );
+    findings.push(finding("vendor", "VENDOR_NAME_VARIANT", "info", "Vendor name variant", `Printed as "${inv.vendor}", matched to vendor master record "${v.name}" (${hit.how} match).`));
   }
   if (v.status === "blocked") {
     findings.push(finding("vendor", "VENDOR_BLOCKED", "reject", "Vendor is blocked", `${v.name} is blocked in the vendor master.`));
@@ -240,18 +255,23 @@ export function checkVendor(inv: Invoice, vendors: Vendor[]): { vendor: Vendor |
       findings.push(
         finding(
           "vendor",
-          "BANK_DETAILS_CHANGED",
+          "BANK_ACCOUNT_MISMATCH",
           "escalate",
-          "Remit-to bank account differs from vendor master",
-          `Invoice asks for payment to account ending ${last4(inv.bankAccount)}; the vendor master has ${v.bankName} account ending ${last4(v.bankAccount)}. Changed bank details on an invoice are the most common payment-fraud pattern. Verify by phone using the contact on file, never the one on the invoice.`,
+          "Bank account differs from approved vendor records",
+          `The invoice asks for payment to an account that is not on file for ${v.name}. Changed bank details on an invoice are the most common payment-fraud pattern. Verify the change by calling the vendor on the number already in the vendor master, never a number from the invoice or email.`,
+          [
+            { label: "Approved account (vendor master)", value: `${maskAccount(v.bankAccount)} · ${v.bankName}`, tone: "good" },
+            { label: "Account on invoice", value: maskAccount(inv.bankAccount), tone: "bad" },
+            { label: "Trusted contact on file", value: v.phone },
+          ],
         ),
       );
-      lines.push(`Bank account on invoice ends ${last4(inv.bankAccount)} ≠ master ${last4(v.bankAccount)}`);
+      lines.push(`Invoice account ${maskAccount(inv.bankAccount)} ≠ approved ${maskAccount(v.bankAccount)}`);
     } else {
-      lines.push(`Bank account matches master (ending ${last4(v.bankAccount)})`);
+      lines.push(`Bank account matches vendor master (${maskAccount(v.bankAccount)})`);
     }
   } else {
-    lines.push("No bank details printed; will pay to account on file");
+    lines.push("No bank details printed; payment would go to the account on file");
   }
   return { vendor: v, findings, lines };
 }
@@ -262,7 +282,9 @@ function poKey(s: string): string {
   return s.toUpperCase().replace(/[^A-Z0-9]/g, "");
 }
 
-function sameInvoice(a: { vendorId: string | null; vendor: string; invoiceNumber: string | null }, b: { vendorId: string | null; vendor: string; invoiceNumber: string | null }): boolean {
+type InvoiceKey = { vendorId: string | null; vendor: string; invoiceNumber: string | null };
+
+function sameInvoice(a: InvoiceKey, b: InvoiceKey): boolean {
   const na = normalizeInvoiceNumber(a.invoiceNumber);
   if (!na || na !== normalizeInvoiceNumber(b.invoiceNumber)) return false;
   if (a.vendorId && b.vendorId) return a.vendorId === b.vendorId;
@@ -270,18 +292,18 @@ function sameInvoice(a: { vendorId: string | null; vendor: string; invoiceNumber
 }
 
 function priorOnPo(po: PurchaseOrder, inv: Invoice, vendorId: string | null, ledger: LedgerInvoice[]): LedgerInvoice[] {
-  return ledger.filter(
-    (l) => l.poId === po.id && !sameInvoice(l, { vendorId, vendor: inv.vendor, invoiceNumber: inv.invoiceNumber }),
-  );
+  // A duplicate of this invoice is not "previous billing" — counting it would double-count.
+  return ledger.filter((l) => l.poId === po.id && !sameInvoice(l, { vendorId, vendor: inv.vendor, invoiceNumber: inv.invoiceNumber }));
 }
 
-function billingFor(po: PurchaseOrder, inv: Invoice, vendorId: string | null, ledger: LedgerInvoice[]): BillingSummary {
+function billingFor(po: PurchaseOrder, inv: Invoice, vendorId: string | null, ledger: LedgerInvoice[], rules: Rules): BillingSummary {
   const prior = priorOnPo(po, inv, vendorId, ledger);
   const previouslyBilled = round2(prior.reduce((s, l) => s + l.total, 0));
   const thisInvoice = inv.total ?? 0;
   const billedAfter = round2(previouslyBilled + thisInvoice);
   return {
     poTotal: po.total,
+    tolerancePct: rules.amountTolerancePct,
     previouslyBilled,
     thisInvoice,
     billedAfter,
@@ -304,7 +326,7 @@ function inferPo(inv: Invoice, vendor: Vendor | null, pos: PurchaseOrder[], ledg
   const candidates = pos.filter((p) => p.vendorId === vendor.id && p.status === "open");
   let best: { po: PurchaseOrder; score: number; note: string } | null = null;
   for (const po of candidates) {
-    const b = billingFor(po, inv, vendor.id, ledger);
+    const b = billingFor(po, inv, vendor.id, ledger, rules);
     const remaining = round2(po.total - b.previouslyBilled);
     if (remaining <= 0) continue;
     const amountFit = 1 - Math.min(1, Math.abs(remaining - inv.total) / remaining);
@@ -316,7 +338,7 @@ function inferPo(inv: Invoice, vendor: Vendor | null, pos: PurchaseOrder[], ledg
       best = {
         po,
         score,
-        note: `vendor ${vendor.name}; invoice ${money(inv.total, inv.currency)} vs ${money(remaining, po.currency)} open on PO; ${matchedLines}/${inv.lineItems.length} line descriptions match`,
+        note: `same vendor; invoice ${money(inv.total, inv.currency)} vs ${money(remaining, po.currency)} open on the PO; ${matchedLines} of ${inv.lineItems.length} line descriptions match`,
       };
     }
   }
@@ -333,6 +355,7 @@ export function matchPurchaseOrder(
 ): { poMatch: PoMatch; findings: Finding[]; lines: string[] } {
   const findings: Finding[] = [];
   const lines: string[] = [];
+  const c = inv.currency;
   let po: PurchaseOrder | null = null;
   let method: PoMatch["method"] = "none";
   let inferenceNote: string | undefined;
@@ -341,12 +364,12 @@ export function matchPurchaseOrder(
     po = pos.find((p) => poKey(p.id) === poKey(inv.poReference!)) ?? null;
     if (po) {
       method = "explicit";
-      lines.push(`PO reference ${inv.poReference} found: ${po.id} (${po.vendor}, ${money(po.total, po.currency)})`);
+      lines.push(`PO ${inv.poReference} found: ${po.id} · ${po.vendor} · ${money(po.total, po.currency)}`);
     } else {
-      lines.push(`PO reference ${inv.poReference} not found in PO table`);
+      lines.push(`PO ${inv.poReference} is not in the PO table`);
     }
   } else {
-    lines.push("No PO reference printed on the invoice");
+    lines.push("No PO number printed on the invoice");
   }
 
   if (!po) {
@@ -355,20 +378,23 @@ export function matchPurchaseOrder(
       po = inferred.po;
       method = "inferred";
       inferenceNote = inferred.note;
-      lines.push(`Inferred ${po.id} from ${inferred.note}`);
+      lines.push(`Suggested ${po.id}: ${inferred.note}`);
       findings.push(
         finding(
           "po_match",
-          "PO_INFERRED",
+          "PO_MATCH_UNCONFIRMED",
           "review",
-          `PO inferred: ${po.id}`,
-          `${inv.poReference ? `Printed PO "${inv.poReference}" does not exist` : "No PO number on the invoice"}. Best match is ${po.id} (${inferred.note}). A person should confirm the match before payment.`,
+          `Suggested PO ${po.id} needs confirmation`,
+          `${inv.poReference ? `Printed PO "${inv.poReference}" does not exist` : "No PO number on the invoice"}. The closest open PO is ${po.id} (${inferred.note}). This is a suggestion, not a confirmed match: confirm with the requester (${po.approvedBy}) before approving.`,
+          [
+            { label: "PO on invoice", value: inv.poReference ?? "none", tone: "bad" },
+            { label: "Suggested PO", value: `${po.id} · ${money(po.total, po.currency)}` },
+            { label: "PO owner", value: po.approvedBy },
+          ],
         ),
       );
     } else if (inv.poReference) {
-      findings.push(
-        finding("po_match", "UNKNOWN_PO", "review", "PO number not recognised", `PO "${inv.poReference}" is not in the PO table and no open PO for this vendor fits the invoice.`),
-      );
+      findings.push(finding("po_match", "UNKNOWN_PO", "review", "PO number not recognised", `PO "${inv.poReference}" is not in the PO table and no open PO for this vendor fits the invoice.`));
     } else {
       findings.push(
         finding(
@@ -376,7 +402,7 @@ export function matchPurchaseOrder(
           "MISSING_PO_REFERENCE",
           "review",
           "No PO reference and no matching open PO",
-          vendor ? `No open PO for ${vendor.name} can absorb ${money(inv.total, inv.currency)}. Ask the requester to raise or identify a PO.` : "Cannot infer a PO for an unknown vendor.",
+          vendor ? `No open PO for ${vendor.name} can absorb ${money(inv.total, c)}. Ask the requester to identify or raise a PO.` : "A PO cannot be suggested for a vendor that is not in the vendor master.",
         ),
       );
     }
@@ -385,9 +411,7 @@ export function matchPurchaseOrder(
   if (!po) return { poMatch: { po: null, method: "none" }, findings, lines };
 
   if (vendor && po.vendorId !== vendor.id) {
-    findings.push(
-      finding("po_match", "PO_VENDOR_MISMATCH", "escalate", "PO belongs to a different vendor", `${po.id} was raised for ${po.vendor}, but the invoice is from ${vendor.name}.`),
-    );
+    findings.push(finding("po_match", "PO_VENDOR_MISMATCH", "escalate", "PO belongs to a different vendor", `${po.id} was raised for ${po.vendor}, but the invoice is from ${vendor.name}.`));
   }
   const asOf = inv.issueDate ?? today;
   if (po.status === "expired" || po.expirationDate < asOf) {
@@ -399,122 +423,178 @@ export function matchPurchaseOrder(
     findings.push(finding("po_match", "CURRENCY_MISMATCH", "review", "Currency differs from PO", `Invoice in ${inv.currency}, PO in ${po.currency}.`));
   }
 
-  // Value: compare against what is still open on the PO, not the full PO.
-  // This is what makes split invoicing work without false alarms.
-  const billing = billingFor(po, inv, vendor?.id ?? null, ledger);
-  const ceiling = po.total * (1 + rules.amountTolerancePct);
-  const pct = (n: number) => `${((n / po.total) * 100).toFixed(1)}%`;
+  // Value: cumulative billing (previous invoices on this PO + this one) vs the
+  // PO value plus the allowed tolerance. Split invoicing passes as long as the
+  // running total stays inside the PO.
+  const billing = billingFor(po, inv, vendor?.id ?? null, ledger, rules);
+  const ceiling = round2(po.total * (1 + rules.amountTolerancePct));
+  const variance = round2(billing.billedAfter - po.total);
+  const variancePct = po.total ? variance / po.total : 0;
+  const tolText = `${(rules.amountTolerancePct * 100).toFixed(2)}%`;
+  const valueEvidence: Evidence[] = [
+    { label: "PO value", value: money(po.total, po.currency) },
+    ...(billing.previouslyBilled > 0 ? [{ label: `Previously billed (${billing.priorInvoices.join(", ")})`, value: money(billing.previouslyBilled, po.currency) }] : []),
+    { label: "This invoice", value: money(billing.thisInvoice, c) },
+    { label: "Cumulative billed", value: money(billing.billedAfter, po.currency) },
+    { label: "Variance vs PO", value: `${signedMoney(variance, po.currency)} (${pct(variancePct)})`, tone: billing.billedAfter > ceiling ? "bad" : "neutral" },
+    { label: "Allowed tolerance", value: `${tolText} (up to ${money(ceiling, po.currency)})` },
+  ];
   lines.push(
-    `PO value ${money(po.total, po.currency)} · previously billed ${money(billing.previouslyBilled, po.currency)}${billing.priorInvoices.length ? ` (${billing.priorInvoices.join(", ")})` : ""} · this invoice ${money(billing.thisInvoice, po.currency)} → ${pct(billing.billedAfter)} billed`,
+    `PO ${money(po.total, po.currency)} · previously billed ${money(billing.previouslyBilled, po.currency)} · this invoice ${money(billing.thisInvoice, c)} · cumulative ${money(billing.billedAfter, po.currency)} (${pct(variancePct)} vs PO, tolerance ${tolText})`,
   );
   if (billing.billedAfter > ceiling) {
     if (billing.previouslyBilled > 0) {
       findings.push(
         finding(
           "po_match",
-          "CUMULATIVE_OVERBILLING",
+          "CUMULATIVE_PO_EXCEEDED",
           "review",
-          "Split invoices exceed the PO",
-          `${po.id} is for ${money(po.total, po.currency)}. Already billed ${money(billing.previouslyBilled, po.currency)} on ${billing.priorInvoices.join(", ")}; this invoice adds ${money(billing.thisInvoice, po.currency)}, bringing the total to ${money(billing.billedAfter, po.currency)} (${pct(billing.billedAfter)} of the PO, tolerance ${(rules.amountTolerancePct * 100).toFixed(0)}%). Over by ${money(billing.billedAfter - po.total, po.currency)}.`,
+          "Cumulative billing exceeds the PO",
+          `${po.id} is for ${money(po.total, po.currency)}. ${money(billing.previouslyBilled, po.currency)} was already billed on ${billing.priorInvoices.join(", ")}; this invoice adds ${money(billing.thisInvoice, c)}, so ${money(billing.billedAfter, po.currency)} would be billed in total, ${money(variance, po.currency)} (${pct(variancePct, 1)}) over the PO. Tolerance is ${tolText}.`,
+          valueEvidence,
         ),
       );
     } else {
       findings.push(
         finding(
           "po_match",
-          "AMOUNT_OVER_PO",
+          "PO_AMOUNT_EXCEEDED",
           "review",
-          "Invoice exceeds PO value",
-          `Invoice ${money(billing.thisInvoice, po.currency)} vs PO ${money(po.total, po.currency)} (${pct(billing.billedAfter)}; tolerance ${(rules.amountTolerancePct * 100).toFixed(0)}%).`,
+          "Invoice exceeds the PO value",
+          `Invoice ${money(billing.thisInvoice, c)} vs PO ${money(po.total, po.currency)}: ${signedMoney(variance, po.currency)} (${pct(variancePct, 1)}), above the ${tolText} tolerance.`,
+          valueEvidence,
         ),
       );
     }
   } else if (billing.previouslyBilled > 0 || billing.remainingAfter > po.total * rules.amountTolerancePct) {
     findings.push(
-      finding(
-        "po_match",
-        "PARTIAL_BILLING",
-        "info",
-        "Partial billing against PO",
-        `After this invoice ${pct(billing.billedAfter)} of ${po.id} is billed; ${money(Math.max(0, billing.remainingAfter), po.currency)} remains open.`,
-      ),
+      finding("po_match", "PARTIAL_BILLING", "info", "Partial billing against PO", `After this invoice ${money(billing.billedAfter, po.currency)} of ${po.id} is billed; ${money(Math.max(0, billing.remainingAfter), po.currency)} remains open.`, valueEvidence),
     );
-  } else if (Math.abs(billing.remainingAfter) >= 0.01) {
+  } else if (Math.abs(variance) >= 0.01) {
     findings.push(
-      finding("po_match", "WITHIN_TOLERANCE", "info", "Small variance within tolerance", `Invoice differs from PO value by ${money(Math.abs(billing.remainingAfter), po.currency)} (within ${(rules.amountTolerancePct * 100).toFixed(0)}%).`),
+      finding("po_match", "WITHIN_TOLERANCE", "info", "Small variance within tolerance", `Invoice is ${signedMoney(variance, po.currency)} (${pct(variancePct)}) vs the PO, inside the ${tolText} tolerance.`, valueEvidence),
     );
   }
 
   // Lines: quantity (cumulative across split invoices) and unit price.
   const prior = priorOnPo(po, inv, vendor?.id ?? null, ledger);
+  const lineChecks: LineCheck[] = [];
   for (const li of inv.lineItems) {
     const poLine = matchLine(li.description, po.lineItems);
     if (!poLine) {
-      findings.push(finding("po_match", "LINE_NOT_ON_PO", "review", "Line not on PO", `"${li.description}" (${money(li.total, inv.currency)}) does not correspond to any line on ${po.id}.`));
+      lineChecks.push({ description: li.description, poDescription: null, poQty: null, priorQty: 0, invoiceQty: li.quantity, poUnitPrice: null, invoiceUnitPrice: li.unitPrice, status: "not_on_po" });
+      findings.push(finding("po_match", "LINE_NOT_ON_PO", "review", "Line not on PO", `"${li.description}" (${money(li.total, c)}) does not correspond to any line on ${po.id}.`));
       continue;
     }
-    const priorQty = prior.reduce((s, p) => {
-      const m = matchLine(poLine.description, p.lineItems);
-      return s + (m ? m.quantity : 0);
-    }, 0);
-    if (priorQty + li.quantity > poLine.quantity + rules.quantityTolerance) {
+    const priorQty = prior.reduce((s, p) => s + (matchLine(poLine.description, p.lineItems)?.quantity ?? 0), 0);
+    const drift = poLine.unitPrice > 0 ? (li.unitPrice - poLine.unitPrice) / poLine.unitPrice : 0;
+    const qtyOver = priorQty + li.quantity > poLine.quantity + rules.quantityTolerance;
+    const priceOver = drift > rules.priceTolerancePct;
+    lineChecks.push({
+      description: li.description,
+      poDescription: poLine.description,
+      poQty: poLine.quantity,
+      priorQty,
+      invoiceQty: li.quantity,
+      poUnitPrice: poLine.unitPrice,
+      invoiceUnitPrice: li.unitPrice,
+      status: qtyOver ? "qty_over" : priceOver ? "price_over" : "ok",
+    });
+    if (qtyOver) {
       findings.push(
         finding(
           "po_match",
-          "QUANTITY_OVER_PO",
+          "QUANTITY_EXCEEDS_PO",
           "review",
           "Quantity exceeds what was ordered",
-          `"${poLine.description}": ordered ${poLine.quantity}, previously billed ${priorQty}, this invoice ${li.quantity} → ${priorQty + li.quantity} billed.`,
+          `"${poLine.description}": ordered ${poLine.quantity}, previously billed ${priorQty}, this invoice ${li.quantity}, so ${priorQty + li.quantity} would be billed.`,
+          [
+            { label: "Ordered (PO)", value: String(poLine.quantity) },
+            { label: "Previously billed", value: String(priorQty) },
+            { label: "This invoice", value: String(li.quantity) },
+            { label: "Cumulative", value: String(priorQty + li.quantity), tone: "bad" },
+          ],
         ),
       );
     }
-    const drift = poLine.unitPrice > 0 ? (li.unitPrice - poLine.unitPrice) / poLine.unitPrice : 0;
-    if (drift > rules.priceTolerancePct) {
+    if (priceOver) {
       findings.push(
-        finding(
-          "po_match",
-          "PRICE_VARIANCE",
-          "review",
-          "Unit price above PO price",
-          `"${poLine.description}": invoiced at ${money(li.unitPrice, inv.currency)} vs PO ${money(poLine.unitPrice, po.currency)} (+${(drift * 100).toFixed(1)}%).`,
-        ),
+        finding("po_match", "PRICE_VARIANCE", "review", "Unit price above PO price", `"${poLine.description}": invoiced at ${money(li.unitPrice, c)} vs PO ${money(poLine.unitPrice, po.currency)} (${pct(drift, 1)}).`),
       );
     }
   }
 
-  return { poMatch: { po, method, inferenceNote, billing }, findings, lines };
+  return { poMatch: { po, method, inferenceNote, billing, lines: lineChecks }, findings, lines };
 }
 
 // ---------- Stage: duplicates ----------
 
-export function checkDuplicates(inv: Invoice, vendor: Vendor | null, ledger: LedgerInvoice[], rules: Rules): { findings: Finding[]; lines: string[] } {
+export interface PriorSubmission {
+  runId: string;
+  fileHash: string;
+  createdAt: number;
+  status: CaseStatus;
+  invoiceNumber: string | null;
+}
+
+export function describeLedgerStatus(s: LedgerInvoice["status"]): string {
+  return s === "paid" ? "paid (payment record in ERP)" : s === "approved" ? "approved for payment, not yet paid" : "already submitted and under review";
+}
+
+export function checkDuplicates(
+  inv: Invoice,
+  vendor: Vendor | null,
+  ledger: LedgerInvoice[],
+  rules: Rules,
+  fileHash: string,
+  prior: PriorSubmission[],
+): { findings: Finding[]; lines: string[]; duplicateOf?: DuplicateRef; repeat: boolean } {
   const findings: Finding[] = [];
   const vendorId = vendor?.id ?? null;
   const sameVendor = ledger.filter((l) => (vendorId && l.vendorId ? l.vendorId === vendorId : normalizeName(l.vendor) === normalizeName(inv.vendor)));
-  const lines = [`Checked ${ledger.length} known invoices (${sameVendor.length} from this vendor)`];
+  const lines = [`Checked ${ledger.length} known invoices (${sameVendor.length} from this vendor) and ${prior.length} earlier uploads`];
+
+  const sameFile = prior.find((p) => p.fileHash && p.fileHash === fileHash);
+  if (sameFile) {
+    lines.push(`Identical file already uploaded on ${new Date(sameFile.createdAt).toLocaleString()} (run ${sameFile.runId})`);
+    findings.push(
+      finding(
+        "duplicates",
+        "REPEAT_SUBMISSION",
+        "info",
+        "This exact file was uploaded before",
+        `Byte-identical document first processed in run ${sameFile.runId}. This upload is recorded as a repeat submission and does not create a new payable.`,
+      ),
+    );
+  }
 
   const exact = sameVendor.find((l) => sameInvoice(l, { vendorId, vendor: inv.vendor, invoiceNumber: inv.invoiceNumber }));
   if (exact) {
-    const printedDiffers = (exact.invoiceNumber ?? "") !== (inv.invoiceNumber ?? "");
+    const printedDiffers = exact.invoiceNumber !== (inv.invoiceNumber ?? "");
+    const ref: DuplicateRef = { invoiceNumber: exact.invoiceNumber, source: exact.source, status: exact.status, runId: exact.runId, issueDate: exact.issueDate, total: exact.total };
     findings.push(
       finding(
         "duplicates",
         "DUPLICATE_INVOICE",
         "reject",
         `Duplicate of ${exact.invoiceNumber}`,
-        `This invoice matches ${exact.invoiceNumber} (${money(exact.total, inv.currency)}, dated ${exact.issueDate}, status ${exact.status.replace("_", " ")}).${printedDiffers ? ` Printed as "${inv.invoiceNumber}", which normalises to the same reference.` : ""} Paying it would pay the same bill twice.`,
+        `Same vendor and same invoice number as ${exact.invoiceNumber} (${money(exact.total, inv.currency)}, dated ${exact.issueDate}), which is ${describeLedgerStatus(exact.status)}.${printedDiffers ? ` Printed here as "${inv.invoiceNumber}", which normalises to the same number.` : ""} Processing it again would create a second payable for the same bill.`,
+        [
+          { label: "This submission", value: `${inv.invoiceNumber ?? "—"} · ${money(inv.total, inv.currency)}` },
+          { label: "Original on file", value: `${exact.invoiceNumber} · ${money(exact.total, inv.currency)} · ${exact.issueDate}` },
+          { label: "Original status", value: describeLedgerStatus(exact.status) },
+          { label: "Source", value: exact.source === "erp" ? "ERP history (demo data)" : `Earlier run ${exact.runId}` },
+        ],
       ),
     );
-    lines.push(`Exact duplicate: "${inv.invoiceNumber}" ≡ "${exact.invoiceNumber}"`);
-    return { findings, lines };
+    lines.push(`Exact duplicate: "${inv.invoiceNumber}" ≡ "${exact.invoiceNumber}" (${describeLedgerStatus(exact.status)})`);
+    return { findings, lines, duplicateOf: ref, repeat: true };
   }
 
   if (inv.total !== null) {
     const day = 86400000;
     const when = inv.issueDate ? Date.parse(inv.issueDate) : NaN;
-    const near = sameVendor.find(
-      (l) => Math.abs(l.total - inv.total!) < 0.01 && (Number.isNaN(when) || Math.abs(Date.parse(l.issueDate) - when) <= rules.duplicateWindowDays * day),
-    );
+    const near = sameVendor.find((l) => Math.abs(l.total - inv.total!) < 0.01 && (Number.isNaN(when) || Math.abs(Date.parse(l.issueDate) - when) <= rules.duplicateWindowDays * day));
     if (near) {
       findings.push(
         finding(
@@ -522,27 +602,71 @@ export function checkDuplicates(inv: Invoice, vendor: Vendor | null, ledger: Led
           "POSSIBLE_DUPLICATE",
           "review",
           `Possible duplicate of ${near.invoiceNumber}`,
-          `Same vendor and same amount (${money(near.total, inv.currency)}) as ${near.invoiceNumber} dated ${near.issueDate}, within ${rules.duplicateWindowDays} days, but a different invoice number. Could be a re-issued invoice.`,
+          `Same vendor and same amount (${money(near.total, inv.currency)}) as ${near.invoiceNumber} dated ${near.issueDate}, within ${rules.duplicateWindowDays} days, but a different invoice number. Could be a re-issued invoice; confirm with the vendor.`,
         ),
       );
       lines.push(`Same vendor + amount as ${near.invoiceNumber} within ${rules.duplicateWindowDays} days`);
-      return { findings, lines };
+      return { findings, lines, repeat: !!sameFile };
     }
   }
-  lines.push("No duplicates found");
-  return { findings, lines };
+  lines.push("No duplicate invoice found");
+  return { findings, lines, repeat: !!sameFile };
 }
 
 // ---------- Stage: decide ----------
 
 const RANK: Record<CheckAction, number> = { info: 0, review: 1, escalate: 2, reject: 3 };
 
-export function decide(inv: Invoice, findings: Finding[], rules: Rules): { decision: Decision; extra: Finding[] } {
+// A concrete instruction per review finding, using the run's own numbers.
+function reviewAction(code: ExceptionCode, inv: Invoice, vendor: Vendor | null, pm?: PoMatch): string | null {
+  const po = pm?.po;
+  const b = pm?.billing;
+  const who = vendor?.name ?? inv.vendor;
+  switch (code) {
+    case "CUMULATIVE_PO_EXCEEDED":
+      return po && b ? `Ask ${who} for a corrected invoice for the ${money(Math.max(0, b.poTotal - b.previouslyBilled), po.currency)} still open on ${po.id}, or have ${po.approvedBy} increase the PO.` : null;
+    case "PO_AMOUNT_EXCEEDED":
+      return po && b ? `Confirm the extra ${money(b.billedAfter - b.poTotal, po.currency)} with ${po.approvedBy} or request a corrected invoice.` : null;
+    case "QUANTITY_EXCEEDS_PO":
+      return "Confirm with receiving how many units were actually delivered.";
+    case "PO_MATCH_UNCONFIRMED":
+      return po ? `Confirm ${po.id} with its owner ${po.approvedBy}, then record the confirmation.` : null;
+    case "HANDWRITTEN_DOCUMENT":
+    case "LOW_EXTRACTION_CONFIDENCE":
+      return "Check the extracted figures against the original document.";
+    case "ARITHMETIC_MISMATCH":
+      return `Ask ${who} for a corrected invoice; do not pay the printed total until it reconciles.`;
+    case "MISSING_FIELD":
+      return `Request a complete invoice from ${who}.`;
+    case "EXPIRED_PO":
+      return po ? `Ask ${po.approvedBy} to re-authorise ${po.id}.` : null;
+    case "POSSIBLE_DUPLICATE":
+      return `Confirm with ${who} whether this re-issues an invoice already on file.`;
+    case "PRICE_VARIANCE":
+      return "Confirm the price change with procurement or request a corrected invoice.";
+    case "MISSING_PO_REFERENCE":
+    case "UNKNOWN_PO":
+      return "Ask the requester to identify the PO, or raise one before approval.";
+    case "LINE_NOT_ON_PO":
+      return "Confirm the extra line with the requester or request a corrected invoice.";
+    case "OVER_APPROVAL_LIMIT":
+      return "A second approver is required by policy.";
+    default:
+      return null;
+  }
+}
+
+export function decide(
+  inv: Invoice,
+  findings: Finding[],
+  rules: Rules,
+  vendor: Vendor | null,
+  duplicateOf?: DuplicateRef,
+  poMatch?: PoMatch,
+): { decision: Decision; extra: Finding[] } {
   const extra: Finding[] = [];
   if (inv.total !== null && inv.total > rules.autoApproveLimit) {
-    extra.push(
-      finding("decide", "OVER_APPROVAL_LIMIT", "review", "Above auto-approval limit", `Total ${money(inv.total, inv.currency)} exceeds the ${money(rules.autoApproveLimit, inv.currency)} auto-approval limit.`),
-    );
+    extra.push(finding("decide", "OVER_APPROVAL_LIMIT", "review", "Above auto-approval limit", `Total ${money(inv.total, inv.currency)} exceeds the ${money(rules.autoApproveLimit, inv.currency)} auto-approval limit.`));
   }
   const all = [...findings, ...extra];
   const top = all.reduce((m, f) => Math.max(m, RANK[f.action]), 0);
@@ -555,39 +679,47 @@ export function decide(inv: Invoice, findings: Finding[], rules: Rules): { decis
   let nextAction: string;
   if (top === RANK.reject) {
     resolution = "REJECT";
-    headline = has("DUPLICATE_INVOICE") ? "Rejected: duplicate of an invoice already on file" : "Rejected";
-    nextAction = has("DUPLICATE_INVOICE")
-      ? "Do not pay. Reply to the vendor that this invoice was already received and paid, quoting the original reference."
-      : "Do not pay. Notify the vendor of the rejection reason.";
+    if (has("DUPLICATE_INVOICE") && duplicateOf) {
+      headline = `Rejected: duplicate of ${duplicateOf.invoiceNumber}`;
+      nextAction = `Do not process. Tell the vendor this invoice is already on file as ${duplicateOf.invoiceNumber} (${describeLedgerStatus(duplicateOf.status)}). No new payable was created.`;
+    } else {
+      headline = "Rejected";
+      nextAction = "Do not process. Notify the vendor of the rejection reason.";
+    }
   } else if (top === RANK.escalate) {
     resolution = "ESCALATE";
-    if (has("BANK_DETAILS_CHANGED")) {
-      headline = "Payment hold: bank details changed";
-      nextAction = "Hold payment. AP manager to verify the bank change by calling the vendor on the number in the vendor master. Do not use contact details from the invoice.";
-    } else if (has("VENDOR_NOT_IN_MASTER")) {
-      headline = "Payment hold: unknown vendor";
-      nextAction = "Route to procurement. The vendor must be onboarded and verified (tax ID, bank letter) before any payment.";
+    if (has("BANK_ACCOUNT_MISMATCH")) {
+      headline = "Payment hold: bank account differs from vendor records";
+      nextAction = `Keep on hold. Call ${vendor?.name ?? "the vendor"} on the number in the vendor master${vendor ? `, ${vendor.phone},` : ""} to confirm the bank change. Do not use contact details from the invoice or email. Release only after independent verification.`;
+    } else if (has("UNKNOWN_VENDOR")) {
+      headline = "Payment hold: vendor not in vendor master";
+      nextAction = "Send to procurement for vendor onboarding and verification (legal entity, tax ID, bank confirmation). The invoice cannot be approved until the vendor exists in the vendor master.";
     } else {
-      headline = "Escalated to AP manager";
+      headline = "Payment hold";
       nextAction = deciding.map((f) => f.title).join("; ");
     }
   } else if (top === RANK.review) {
     resolution = "FLAG_FOR_REVIEW";
-    headline = `Needs review: ${deciding.length} item${deciding.length > 1 ? "s" : ""} to confirm`;
-    nextAction = deciding.map((f) => f.title).join(" · ");
+    headline = deciding.length === 1 ? `Needs review: ${deciding[0].title.toLowerCase()}` : `Needs review: ${deciding.length} items to resolve`;
+    const steps = [...new Set(deciding.map((f) => reviewAction(f.code, inv, vendor, poMatch) ?? f.title))];
+    nextAction = steps.length === 1 ? steps[0] : steps.map((s, i) => `${i + 1}. ${s}`).join(" ");
   } else {
     resolution = "AUTO_APPROVE";
-    headline = "Approved for payment";
-    nextAction = `Schedule payment${inv.dueDate ? ` for ${inv.dueDate}` : ""}${inv.paymentTerms ? ` (${inv.paymentTerms})` : ""} to the account on file.`;
+    headline = "Approved: all checks passed";
+    nextAction = `Eligible for payment${inv.dueDate ? ` by ${inv.dueDate}` : ""}${inv.paymentTerms ? ` (${inv.paymentTerms})` : ""} to the account on file. Passed to the payment run; not yet paid.`;
   }
   return { decision: { resolution, headline, decidingCodes: codes, nextAction }, extra };
+}
+
+export function initialStatus(r: Resolution): CaseStatus {
+  return r === "AUTO_APPROVE" ? "approved" : r === "REJECT" ? "rejected" : r === "ESCALATE" ? "payment_hold" : "needs_review";
 }
 
 // ---------- Fallback explanation (used if the LLM is unavailable) ----------
 
 export function templateExplanation(inv: Invoice, poMatch: PoMatch, findings: Finding[], decision: Decision): Explanation {
   const issues = findings.filter((f) => f.action !== "info");
-  const po = poMatch.po ? `${poMatch.po.id}${poMatch.method === "inferred" ? " (inferred)" : ""}` : "no PO";
+  const po = poMatch.po ? `${poMatch.po.id}${poMatch.method === "inferred" ? " (suggested, unconfirmed)" : ""}` : "no PO";
   const summary =
     decision.resolution === "AUTO_APPROVE"
       ? `Invoice ${inv.invoiceNumber ?? "(no number)"} from ${inv.vendor} for ${money(inv.total, inv.currency)} matches ${po}; all checks passed. ${decision.nextAction}`
@@ -603,7 +735,7 @@ export function templateExplanation(inv: Invoice, poMatch: PoMatch, findings: Fi
 
 export function buildLedger(erp: LedgerInvoice[], runs: RunRecord[]): LedgerInvoice[] {
   const fromRuns: LedgerInvoice[] = runs
-    .filter((r) => r.reviewStatus !== "rejected" && r.invoice.invoiceNumber)
+    .filter((r) => r.status !== "rejected" && r.invoice.invoiceNumber)
     .map((r) => ({
       vendorId: r.vendorId,
       vendor: r.invoice.vendor,
@@ -612,7 +744,7 @@ export function buildLedger(erp: LedgerInvoice[], runs: RunRecord[]): LedgerInvo
       total: r.invoice.total ?? 0,
       issueDate: r.invoice.issueDate ?? new Date(r.createdAt).toISOString().slice(0, 10),
       lineItems: r.invoice.lineItems,
-      status: r.reviewStatus === "pending" ? "pending_review" : "approved",
+      status: r.status === "approved" ? "approved" : "in_review",
       source: "run",
       runId: r.id,
     }));
@@ -620,14 +752,13 @@ export function buildLedger(erp: LedgerInvoice[], runs: RunRecord[]): LedgerInvo
 }
 
 export function resolutionLabel(r: Resolution): string {
-  switch (r) {
-    case "AUTO_APPROVE":
-      return "Approved";
-    case "FLAG_FOR_REVIEW":
-      return "Needs review";
-    case "ESCALATE":
-      return "Payment hold";
-    case "REJECT":
-      return "Rejected";
-  }
+  return { AUTO_APPROVE: "Approved", FLAG_FOR_REVIEW: "Needs review", ESCALATE: "Payment hold", REJECT: "Rejected" }[r];
+}
+
+export function statusLabel(s: CaseStatus): string {
+  return { approved: "Approved", needs_review: "Needs review", payment_hold: "Payment hold", awaiting_info: "Awaiting vendor", rejected: "Rejected" }[s];
+}
+
+export function isOpen(s: CaseStatus): boolean {
+  return s === "needs_review" || s === "payment_hold" || s === "awaiting_info";
 }

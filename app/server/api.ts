@@ -2,7 +2,7 @@
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { forwardChat, forwardChatStream, getHealth } from "./proxy.ts";
-import { addRun, clearRuns, listRuns, reviewRun } from "./store.ts";
+import { actOnRun, addRun, clearRuns, listRuns, readPreview } from "./store.ts";
 
 async function readJson(req: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
@@ -56,16 +56,20 @@ export async function handleApi(req: IncomingMessage, res: ServerResponse): Prom
     } else if (url === "/api/runs" && req.method === "DELETE") {
       await clearRuns();
       sendJson(res, 200, { ok: true });
-    } else if (url.startsWith("/api/runs/") && req.method === "PATCH") {
-      const id = decodeURIComponent(url.slice("/api/runs/".length));
-      const body = (await readJson(req)) as { reviewStatus?: string; reviewNote?: string };
-      if (body.reviewStatus !== "approved" && body.reviewStatus !== "rejected") {
-        sendJson(res, 400, { error: "reviewStatus must be approved or rejected" });
-      } else {
-        const run = await reviewRun(id, body.reviewStatus, body.reviewNote ?? "");
-        if (run) sendJson(res, 200, run);
-        else sendJson(res, 404, { error: "run not found" });
+    } else if (/^\/api\/runs\/[^/]+\/preview$/.test(url) && req.method === "GET") {
+      const doc = await readPreview(decodeURIComponent(url.split("/")[3]));
+      if (!doc) sendJson(res, 404, { error: "no preview" });
+      else {
+        res.statusCode = 200;
+        res.setHeader("Content-Type", doc.mime);
+        res.setHeader("Cache-Control", "private, max-age=3600");
+        res.end(doc.data);
       }
+    } else if (/^\/api\/runs\/[^/]+\/actions$/.test(url) && req.method === "POST") {
+      const id = decodeURIComponent(url.split("/")[3]);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const result = await actOnRun(id, (await readJson(req)) as any);
+      sendJson(res, result.status, result.body);
     } else {
       sendJson(res, 404, { error: "not found" });
     }

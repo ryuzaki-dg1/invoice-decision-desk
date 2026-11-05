@@ -1,26 +1,46 @@
 :root {
-  --bg: #f4f5f7;
-  --surface: #fcfcfb;
-  --surface-2: #f6f7f9;
-  --border: #e3e5ea;
-  --border-strong: #cfd3db;
-  --ink: #1b1d22;
-  --ink-2: #4a505c;
-  --muted: #7a8190;
-  --accent: #2552e8;
-  --accent-soft: #eaf0ff;
-  --good: #0ca30c;
-  --good-text: #006300;
-  --warning: #fab219;
-  --serious: #ec835a;
-  --critical: #d03b3b;
+  --bg: #f6f8fb;
+  --surface: #ffffff;
+  --surface-2: #f8fafc;
+  --surface-3: #f1f4f9;
+  --border: #e4e9f1;
+  --border-strong: #d3dae6;
+  --ink: #17233b;
+  --ink-2: #3b4760;
+  --muted: #64748b;
+  --faint: #94a3b8;
+  --accent: #355cde;
+  --accent-hover: #2b4ec4;
+  --accent-soft: #eef2fe;
+
+  /* Status (validated as a set for charts; always paired with icon + label) */
+  --ok: #14a06f;
+  --ok-ink: #067a52;
+  --ok-bg: #e8f6f0;
+  --warn: #e9a23b;
+  --warn-ink: #8a5400;
+  --warn-bg: #fdf4e3;
+  --hold: #d9622b;
+  --hold-ink: #a8431a;
+  --hold-bg: #fdefe7;
+  --bad: #8e1d2c;
+  --bad-ink: #8e1d2c;
+  --bad-bg: #fbecee;
+  --info-ink: #3b4a8c;
+  --info-bg: #eef1fd;
+
+  --radius: 10px;
+  --radius-sm: 7px;
+  --shadow: 0 1px 2px rgba(16, 24, 40, 0.04), 0 1px 3px rgba(16, 24, 40, 0.03);
+  --shadow-lg: 0 12px 32px rgba(16, 24, 40, 0.12);
   --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   --sans: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 
   color-scheme: light;
   color: var(--ink);
   background: var(--bg);
-  font: 14px/1.5 var(--sans);
+  font: 14px/1.55 var(--sans);
+  font-feature-settings: "cv11", "ss01";
   -webkit-font-smoothing: antialiased;
 }
 
@@ -36,18 +56,13 @@ body,
   box-sizing: border-box;
 }
 
-h2 {
-  margin: 0 0 12px;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--ink-2);
-  letter-spacing: 0.01em;
-}
-
-h3 {
-  margin: 22px 0 8px;
-  font-size: 13px;
-  color: var(--ink-2);
+h1,
+h2,
+h3,
+h4 {
+  margin: 0;
+  color: var(--ink);
+  letter-spacing: -0.01em;
 }
 
 button {
@@ -57,9 +72,16 @@ button {
 
 button:disabled {
   cursor: not-allowed;
-  opacity: 0.5;
 }
 
 a {
   color: var(--accent);
+  text-decoration: none;
+}
+
+input,
+textarea,
+select {
+  font: inherit;
+  color: inherit;
 }

@@ -1,5 +1,5 @@
 // Core domain types for the invoice-to-decision pipeline.
-// Shared by the browser (pipeline + UI) and the server (run store).
+// Shared by the browser (pipeline + UI) and the server (run store, review rules).
 
 export interface LineItem {
   description: string;
@@ -20,12 +20,15 @@ export interface Invoice {
   lineItems: LineItem[];
   subtotal: number | null;
   tax: number;
-  shipping: number;
+  shipping: number; // freight / delivery, as printed
+  otherCharges: number; // any other explicit surcharge or fee
+  discount: number; // positive number, subtracted
   total: number | null;
   currency: string;
   bankAccount: string | null; // remit-to account number as printed
   documentType: DocumentType;
-  // Fields the model could not read with confidence (smudged, ambiguous digits).
+  // Fields the model said it could not read with certainty. Self-reported by
+  // the model, not a calibrated probability.
   lowConfidenceFields: string[];
 }
 
@@ -35,6 +38,7 @@ export interface Vendor {
   aliases: string[];
   bankAccount: string; // account on file in the vendor master
   bankName: string;
+  phone: string; // trusted contact on file, used for call-back verification
   status: "active" | "blocked";
 }
 
@@ -54,8 +58,8 @@ export interface PurchaseOrder {
   approvedBy: string;
 }
 
-// An invoice already known to the AP ledger: seeded history (previously paid)
-// plus every run processed by this system that was not rejected.
+// An invoice already known to AP: seeded ERP history (with payment records)
+// plus every run processed here that was not rejected.
 export interface LedgerInvoice {
   vendorId: string | null;
   vendor: string;
@@ -64,7 +68,7 @@ export interface LedgerInvoice {
   total: number;
   issueDate: string;
   lineItems: LineItem[];
-  status: "paid" | "approved" | "pending_review";
+  status: "paid" | "approved" | "in_review";
   source: "erp" | "run";
   runId?: string;
 }
@@ -76,29 +80,37 @@ export type CheckAction = "reject" | "escalate" | "review" | "info";
 export type ExceptionCode =
   | "MISSING_FIELD"
   | "ARITHMETIC_MISMATCH"
-  | "LOW_CONFIDENCE_READ"
+  | "LOW_EXTRACTION_CONFIDENCE"
   | "HANDWRITTEN_DOCUMENT"
-  | "VENDOR_NOT_IN_MASTER"
+  | "SCANNED_DOCUMENT"
+  | "UNKNOWN_VENDOR"
   | "VENDOR_BLOCKED"
   | "VENDOR_NAME_VARIANT"
-  | "BANK_DETAILS_CHANGED"
+  | "BANK_ACCOUNT_MISMATCH"
   | "MISSING_PO_REFERENCE"
-  | "PO_INFERRED"
+  | "PO_MATCH_UNCONFIRMED"
   | "UNKNOWN_PO"
   | "PO_VENDOR_MISMATCH"
   | "EXPIRED_PO"
   | "CLOSED_PO"
   | "CURRENCY_MISMATCH"
-  | "AMOUNT_OVER_PO"
-  | "CUMULATIVE_OVERBILLING"
-  | "QUANTITY_OVER_PO"
+  | "PO_AMOUNT_EXCEEDED"
+  | "CUMULATIVE_PO_EXCEEDED"
+  | "QUANTITY_EXCEEDS_PO"
   | "PRICE_VARIANCE"
   | "LINE_NOT_ON_PO"
   | "PARTIAL_BILLING"
   | "WITHIN_TOLERANCE"
   | "DUPLICATE_INVOICE"
   | "POSSIBLE_DUPLICATE"
+  | "REPEAT_SUBMISSION"
   | "OVER_APPROVAL_LIMIT";
+
+export interface Evidence {
+  label: string;
+  value: string;
+  tone?: "bad" | "good" | "neutral";
+}
 
 export interface Finding {
   code: ExceptionCode;
@@ -106,12 +118,14 @@ export interface Finding {
   stage: StageId;
   title: string;
   detail: string;
+  evidence?: Evidence[];
 }
 
 export type Resolution = "AUTO_APPROVE" | "FLAG_FOR_REVIEW" | "ESCALATE" | "REJECT";
 
 export interface BillingSummary {
   poTotal: number;
+  tolerancePct: number;
   previouslyBilled: number;
   thisInvoice: number;
   billedAfter: number;
@@ -119,11 +133,23 @@ export interface BillingSummary {
   priorInvoices: string[];
 }
 
+export interface LineCheck {
+  description: string;
+  poDescription: string | null;
+  poQty: number | null;
+  priorQty: number;
+  invoiceQty: number;
+  poUnitPrice: number | null;
+  invoiceUnitPrice: number;
+  status: "ok" | "qty_over" | "price_over" | "not_on_po";
+}
+
 export interface PoMatch {
   po: PurchaseOrder | null;
   method: "explicit" | "inferred" | "none";
   inferenceNote?: string;
   billing?: BillingSummary;
+  lines?: LineCheck[];
 }
 
 export interface Decision {
@@ -139,17 +165,11 @@ export interface Explanation {
   generatedBy: "llm" | "template";
 }
 
-export type StageId =
-  | "ingest"
-  | "extract"
-  | "validate"
-  | "vendor"
-  | "po_match"
-  | "duplicates"
-  | "decide"
-  | "explain";
+export type StageId = "ingest" | "extract" | "validate" | "vendor" | "po_match" | "duplicates" | "decide" | "explain";
 
-export type StageStatus = "pending" | "running" | "done" | "warn" | "fail" | "skipped";
+// "blocked" = a business rule stopped the invoice (expected behaviour);
+// "error" = the step itself failed to execute.
+export type StageStatus = "pending" | "running" | "done" | "warn" | "blocked" | "error";
 
 export interface StageState {
   id: StageId;
@@ -160,14 +180,36 @@ export interface StageState {
   endedAt?: number;
 }
 
-export type ReviewStatus = "auto_approved" | "pending" | "approved" | "rejected";
+// Current workflow status of an invoice case (changes with reviewer actions).
+export type CaseStatus = "approved" | "needs_review" | "payment_hold" | "awaiting_info" | "rejected";
+
+export interface AuditEvent {
+  at: number;
+  actor: string; // "System" or the reviewer's name
+  kind: "system" | "reviewer";
+  action: string;
+  fromStatus?: CaseStatus;
+  toStatus: CaseStatus;
+  note?: string;
+}
+
+export interface DuplicateRef {
+  invoiceNumber: string;
+  source: "erp" | "run";
+  status: LedgerInvoice["status"];
+  runId?: string;
+  issueDate: string;
+  total: number;
+}
 
 export interface RunRecord {
   id: string;
   createdAt: number;
   durationMs: number;
   fileName: string;
+  fileHash: string;
   pageCount: number;
+  extractionMethod: string;
   invoice: Invoice;
   vendorId: string | null;
   vendorMatched: string | null;
@@ -177,7 +219,11 @@ export interface RunRecord {
   explanation: Explanation;
   stages: StageState[];
   model: string;
-  reviewStatus: ReviewStatus;
-  reviewNote?: string;
-  reviewedAt?: number;
+  status: CaseStatus;
+  // Controls a reviewer has explicitly resolved (e.g. bank change verified, PO confirmed).
+  resolvedCodes: ExceptionCode[];
+  hasPreview: boolean; // first page image stored on the server
+  repeatSubmission: boolean;
+  duplicateOf?: DuplicateRef;
+  audit: AuditEvent[];
 }

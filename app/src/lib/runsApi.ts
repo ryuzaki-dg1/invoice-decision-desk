@@ -1,7 +1,8 @@
 // Client for the server-side run store (/api/runs). Runs are persisted on the
-// server so the dashboard shows the same history in every browser.
+// server so every browser sees the same history and review state.
 
 import type { RunRecord } from "../types.ts";
+import type { ReviewRequest } from "./review.ts";
 
 export async function fetchRuns(): Promise<RunRecord[]> {
   const res = await fetch("/api/runs");
@@ -9,24 +10,27 @@ export async function fetchRuns(): Promise<RunRecord[]> {
   return (await res.json()) as RunRecord[];
 }
 
-export async function saveRun(run: Omit<RunRecord, "id">): Promise<RunRecord> {
-  const res = await fetch("/api/runs", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(run),
-  });
-  if (!res.ok) throw new Error(`Could not save run (${res.status})`);
-  return (await res.json()) as RunRecord;
+// Retries once: the decision has already been computed, so a network blip
+// must not lose it.
+export async function saveRun(run: Omit<RunRecord, "id">, previewImage?: string): Promise<RunRecord> {
+  const body = JSON.stringify({ ...run, previewImage });
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const res = await fetch("/api/runs", { method: "POST", headers: { "Content-Type": "application/json" }, body });
+      if (!res.ok) throw new Error(`Could not save run (${res.status})`);
+      return (await res.json()) as RunRecord;
+    } catch (err) {
+      if (attempt >= 3) throw new Error(`Decision computed but not saved: ${(err as Error).message}`);
+      await new Promise((r) => setTimeout(r, 800 * attempt));
+    }
+  }
 }
 
-export async function reviewRun(id: string, reviewStatus: "approved" | "rejected", reviewNote: string): Promise<RunRecord> {
-  const res = await fetch(`/api/runs/${encodeURIComponent(id)}`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ reviewStatus, reviewNote }),
-  });
-  if (!res.ok) throw new Error(`Could not update run (${res.status})`);
-  return (await res.json()) as RunRecord;
+export async function submitReview(id: string, req: ReviewRequest): Promise<RunRecord> {
+  const res = await fetch(`/api/runs/${encodeURIComponent(id)}/actions`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(req) });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error ?? `Action failed (${res.status})`);
+  return body as RunRecord;
 }
 
 export async function resetRuns(): Promise<void> {

@@ -11,6 +11,7 @@ const MAX_PAGES = 3;
 
 export interface PreparedDocument {
   fileName: string;
+  fileHash: string; // SHA-256 of the uploaded bytes, to recognise re-uploads
   mimeType: string;
   pageImages: string[]; // data URLs (PNG/JPEG)
   textLayer: string;
@@ -27,12 +28,20 @@ function readAsDataUrl(file: Blob): Promise<string> {
   });
 }
 
+async function sha256(buf: ArrayBuffer): Promise<string> {
+  const hash = await crypto.subtle.digest("SHA-256", buf);
+  return [...new Uint8Array(hash)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 export async function prepareDocument(file: File): Promise<PreparedDocument> {
   const isPdf = file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+  const bytes = await file.arrayBuffer();
+  const fileHash = await sha256(bytes);
   if (!isPdf) {
     if (!file.type.startsWith("image/")) throw new Error(`Unsupported file type "${file.type || file.name}". Upload a PDF or an image.`);
     return {
       fileName: file.name,
+      fileHash,
       mimeType: file.type,
       pageImages: [await readAsDataUrl(file)],
       textLayer: "",
@@ -41,7 +50,7 @@ export async function prepareDocument(file: File): Promise<PreparedDocument> {
     };
   }
 
-  const pdf = await pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
+  const pdf = await pdfjs.getDocument({ data: new Uint8Array(bytes) }).promise;
   const pages = Math.min(pdf.numPages, MAX_PAGES);
   const images: string[] = [];
   const texts: string[] = [];
@@ -64,6 +73,7 @@ export async function prepareDocument(file: File): Promise<PreparedDocument> {
   const textLayer = texts.join("\n\n--- page break ---\n\n");
   return {
     fileName: file.name,
+    fileHash,
     mimeType: "application/pdf",
     pageImages: images,
     textLayer,

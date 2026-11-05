@@ -10,7 +10,7 @@ FROM node:22-slim
 WORKDIR /app
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/server ./server
-COPY --from=build /app/src/types.ts ./src/types.ts
+COPY --from=build /app/src ./src
 COPY --from=build /app/package.json /app/package-lock.json ./
 RUN npm ci --omit=dev
 

@@ -86,8 +86,8 @@ acme("01-acme-happy-path.pdf", {
     { d: "Hex bolt M8x40 (box of 100)", q: 25, u: 42 },
     { d: "Lock washer M8 (box of 500)", q: 10, u: 18.5 },
   ],
-  tax: 99.65,
-  shipping: 45,
+  tax: 98.8,
+  shipping: 45.85,
   total: 1379.65,
   bankBlock: acmeBankOk,
 });
