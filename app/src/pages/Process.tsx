@@ -1,42 +1,53 @@
-// Three states: intake → live processing → investigation workspace.
+// Three states: A) intake, B) live processing, C) investigation workspace.
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { ArrowRight, ChevronDown, FileText, Loader2, PenLine, RotateCcw, ScanLine, Sparkles, UploadCloud } from "lucide-react";
 import { PURCHASE_ORDERS } from "../data/purchaseOrders";
 import { SAMPLES, type Sample } from "../data/samples";
 import { ERP_LEDGER, VENDORS } from "../data/vendors";
-import { DocumentPane, Investigation } from "../investigation";
+import { DocumentViewer, Investigation } from "../investigation";
 import { prepareDocument, type PreparedDocument } from "../lib/document";
 import { buildLedger, isOpen, money } from "../lib/engine";
 import { checkHealth } from "../lib/llm";
-import { runPipeline } from "../lib/pipeline";
+import { STAGES, runPipeline } from "../lib/pipeline";
 import { loadRules } from "../lib/rules";
 import { fetchRuns, saveRun } from "../lib/runsApi";
 import { Timeline } from "../runView";
 import { Shell } from "../Shell";
 import type { Invoice, RunRecord, StageState } from "../types";
-import { Icon, StatusBadge, resolutionToStatus, useRuns, useToast } from "../ui";
+import { StatusBadge, resolutionToStatus, useRuns, useToast } from "../ui";
+
+const KIND_ICON = { "Digital PDF": FileText, "Scanned PDF": ScanLine, "Handwritten photo": PenLine };
 
 export default function Process() {
   const { runs, setRuns, replace } = useRuns();
   const [doc, setDoc] = useState<PreparedDocument | null>(null);
   const [activeSample, setActiveSample] = useState<string | null>(null);
+  const [showDemos, setShowDemos] = useState(true);
   const [preparing, setPreparing] = useState(false);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [stages, setStages] = useState<StageState[]>([]);
   const [invoice, setInvoice] = useState<Invoice | null>(null);
-  const [streaming, setStreaming] = useState("");
   const [saved, setSaved] = useState<RunRecord | null>(null);
+  const [startedAt, setStartedAt] = useState<number | null>(null);
+  const [now, setNow] = useState(Date.now());
   const [dragOver, setDragOver] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
   const [toast, notify] = useToast();
 
+  useEffect(() => {
+    if (!running) return;
+    const id = setInterval(() => setNow(Date.now()), 200);
+    return () => clearInterval(id);
+  }, [running]);
+
   const reset = () => {
     setStages([]);
     setInvoice(null);
-    setStreaming("");
     setSaved(null);
     setError(null);
+    setStartedAt(null);
   };
 
   const loadFile = async (file: File, sample: string | null) => {
@@ -52,7 +63,6 @@ export default function Process() {
       setPreparing(false);
     }
   };
-
   const loadSample = async (s: Sample) => {
     const blob = await (await fetch(`/samples/${s.file}`)).blob();
     await loadFile(new File([blob], s.file, { type: blob.type || (s.file.endsWith(".pdf") ? "application/pdf" : "image/jpeg") }), s.file);
@@ -62,6 +72,7 @@ export default function Process() {
     if (!doc) return;
     reset();
     setRunning(true);
+    setStartedAt(Date.now());
     try {
       const health = await checkHealth();
       if (!health.ok) throw new Error(health.reason ?? "AI service not configured");
@@ -77,11 +88,7 @@ export default function Process() {
           today: new Date().toISOString().slice(0, 10),
           model: `${health.provider}/${health.model}`,
         },
-        {
-          onStage: (s) => setStages((prev) => [...prev.filter((p) => p.id !== s.id), s]),
-          onInvoice: setInvoice,
-          onExplainToken: (t) => setStreaming((p) => p + t),
-        },
+        { onStage: (s) => setStages((p) => [...p.filter((x) => x.id !== s.id), s]), onInvoice: setInvoice },
       );
       const rec = await saveRun(out, doc.pageImages[0]);
       setSaved(rec);
@@ -96,36 +103,27 @@ export default function Process() {
   const openCount = runs.filter((r) => isOpen(r.status)).length;
   const phase: "intake" | "running" | "done" = saved ? "done" : running || stages.length ? "running" : "intake";
 
-  // ---------- State C: investigation ----------
+  // ---------- C: decision ready ----------
   if (phase === "done" && saved) {
     return (
-      <Shell page="process" openCount={openCount}>
+      <Shell page="process" openCount={openCount} wide>
         <Investigation
           run={saved}
           allRuns={runs}
           previewSrc={doc?.pageImages[0]}
-          onUpdated={(r) => {
-            setSaved(r);
-            replace(r);
-          }}
+          onUpdated={(r) => (setSaved(r), replace(r))}
           notify={notify}
           breadcrumb={
             <>
-              <a href="/history">Invoices</a> / <span>{saved.invoice.invoiceNumber ?? saved.fileName}</span>
+              <a href="/process">Process invoice</a>
+              <span>/</span>
+              <span className="crumb-cur">{saved.invoice.invoiceNumber ?? saved.fileName}</span>
             </>
           }
-          extraHeader={
-            <div className="inv-after">
-              <span className="small muted">Just processed in {(saved.durationMs / 1000).toFixed(1)} s</span>
-              <button
-                className="btn btn-sm"
-                onClick={() => {
-                  reset();
-                  setDoc(null);
-                  setActiveSample(null);
-                }}
-              >
-                Process another invoice
+          headerExtra={
+            <div className="inv-tools">
+              <button className="btn btn-sm" onClick={() => (reset(), setDoc(null), setActiveSample(null))}>
+                <RotateCcw size={14} /> Process another invoice
               </button>
             </div>
           }
@@ -135,33 +133,50 @@ export default function Process() {
     );
   }
 
-  // ---------- State B: processing ----------
+  // ---------- B: processing ----------
   if (phase === "running" && doc) {
+    const done = stages.filter((s) => s.endedAt).length;
     const active = stages.find((s) => s.status === "running");
+    const activeDef = STAGES.find((d) => d.id === active?.id);
+    const elapsed = ((startedAt ? (running ? now : stages.reduce((m, s) => Math.max(m, s.endedAt ?? 0), startedAt)) - startedAt : 0) / 1000).toFixed(1);
     return (
-      <Shell page="process" openCount={openCount}>
+      <Shell page="process" openCount={openCount} wide>
         <div className="crumbs">
-          <a href="/process">Process invoice</a> / <span>{doc.fileName}</span>
+          <a href="/process">Process invoice</a>
+          <span>/</span>
+          <span className="crumb-cur">{doc.fileName}</span>
         </div>
-        <div className="inv-split" style={{ marginTop: 12 }}>
-          <DocumentPane src={doc.pageImages[0]} title={doc.fileName} meta={`${doc.pageCount} page${doc.pageCount > 1 ? "s" : ""} · ${doc.hasTextLayer ? "digital" : "no text layer"}`} />
-          <section className="running">
-            <div className="eyebrow">{error ? "Stopped" : running ? "Processing" : "Finishing"}</div>
-            <h1 className="display-sm">{invoice ? `${invoice.vendor} · ${money(invoice.total, invoice.currency)}` : "Reading the document…"}</h1>
-            <p className="muted">{active ? `Now: ${active.summary ?? ""}` : error ? "" : "Saving the decision…"}</p>
-            <Timeline stages={stages} live={running} />
-            {streaming && (
-              <div className="streambox">
-                <div className="eyebrow">Explanation (AI, written from the rule findings)</div>
-                <pre className="stream">
-                  {streaming}
-                  <span className="caret">▋</span>
-                </pre>
+        <div className="inv-split" style={{ marginTop: 16 }}>
+          <DocumentViewer src={doc.pageImages[0]} title={doc.fileName} meta={`${doc.pageCount} page${doc.pageCount > 1 ? "s" : ""}`} />
+          <section className="card proc">
+            <div className="proc-head">
+              <div>
+                <div className="proc-k">{error ? "Stopped" : running ? "Processing invoice" : "Saving decision"}</div>
+                <h1 className="h1">{invoice ? `${invoice.vendor || "Unknown vendor"} · ${money(invoice.total, invoice.currency)}` : "Reading the document"}</h1>
               </div>
-            )}
+              <div className="proc-clock" aria-live="off">
+                <b>{elapsed}s</b>
+                <small>elapsed</small>
+              </div>
+            </div>
+            <div className="proc-bar" role="progressbar" aria-valuemin={0} aria-valuemax={8} aria-valuenow={done} aria-label="Checks completed">
+              <span style={{ width: `${(done / STAGES.length) * 100}%` }} />
+            </div>
+            <div className="proc-now">
+              {running && active ? (
+                <>
+                  <Loader2 size={16} className="spin" /> <b>{activeDef?.label}</b> <span className="muted">{active.id === "extract" || active.id === "explain" ? "· AI" : "· rules"}</span>
+                </>
+              ) : (
+                <span className="muted">
+                  {done} of {STAGES.length} checks complete
+                </span>
+              )}
+            </div>
+            <Timeline stages={stages} live={running} />
             {error && (
               <div className="alert alert-err" role="alert">
-                <strong>System error, not a business rule.</strong> {error}
+                <b>System error, not a business rule.</b> {error}
                 <div className="actions" style={{ marginTop: 10 }}>
                   <button className="btn btn-primary btn-sm" onClick={run}>
                     Try again
@@ -178,103 +193,118 @@ export default function Process() {
     );
   }
 
-  // ---------- State A: intake ----------
+  // ---------- A: intake ----------
   return (
     <Shell page="process" openCount={openCount}>
       <div className="intake">
-        <section className="intake-main">
-          <div className="eyebrow">Process invoice</div>
-          <h1 className="display">Process an invoice</h1>
-          <p className="hero-sub">Each control runs live; the decision comes with its evidence and the next action.</p>
-          <div
-            className={`dropzone ${dragOver ? "on" : ""} ${doc ? "has-doc" : ""}`}
-            role="button"
-            tabIndex={0}
-            onClick={() => fileInput.current?.click()}
-            onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && fileInput.current?.click()}
-            onDragOver={(e) => {
-              e.preventDefault();
-              setDragOver(true);
-            }}
-            onDragLeave={() => setDragOver(false)}
-            onDrop={(e) => {
-              e.preventDefault();
-              setDragOver(false);
-              const f = e.dataTransfer.files?.[0];
+        <div className="intake-hero">
+          <span className="intake-badge">
+            <Sparkles size={14} /> AI reads the document · rules make the decision
+          </span>
+          <h1 className="h-display">Let's process an invoice</h1>
+          <p className="sub">Upload a document. We'll extract the details, verify the records, and explain the decision.</p>
+        </div>
+
+        <div
+          className={`drop ${dragOver ? "on" : ""} ${doc ? "has" : ""}`}
+          onDragOver={(e) => (e.preventDefault(), setDragOver(true))}
+          onDragLeave={() => setDragOver(false)}
+          onDrop={(e) => {
+            e.preventDefault();
+            setDragOver(false);
+            const f = e.dataTransfer.files?.[0];
+            if (f) loadFile(f, null);
+          }}
+        >
+          <input
+            ref={fileInput}
+            type="file"
+            accept=".pdf,.png,.jpg,.jpeg,.webp"
+            hidden
+            onChange={(e) => {
+              const f = e.target.files?.[0];
               if (f) loadFile(f, null);
+              e.target.value = "";
             }}
-          >
-            <input
-              ref={fileInput}
-              type="file"
-              accept=".pdf,.png,.jpg,.jpeg,.webp"
-              hidden
-              onChange={(e) => {
-                const f = e.target.files?.[0];
-                if (f) loadFile(f, null);
-                e.target.value = "";
-              }}
-            />
-            {preparing ? (
-              <div className="dz-doc">
-                <div className="skeleton dz-thumb" />
-                <div style={{ flex: 1, display: "grid", gap: 8 }}>
-                  <div className="skeleton" style={{ height: 18, width: "60%" }} />
-                  <div className="skeleton" style={{ height: 14, width: "40%" }} />
+          />
+          {preparing ? (
+            <div className="drop-doc">
+              <div className="skeleton drop-thumb" />
+              <div style={{ flex: 1, display: "grid", gap: 8 }}>
+                <div className="skeleton" style={{ height: 20, width: "55%" }} />
+                <div className="skeleton" style={{ height: 14, width: "35%" }} />
+              </div>
+            </div>
+          ) : doc ? (
+            <div className="drop-doc">
+              <img src={doc.pageImages[0]} alt="Selected invoice" className="drop-thumb" />
+              <div className="drop-meta">
+                <div className="drop-name">{doc.fileName}</div>
+                <div className="muted">
+                  {doc.hasTextLayer ? "Digital PDF · text layer found" : doc.mimeType === "application/pdf" ? "Scanned PDF · will be read from the image" : "Photo · will be read from the image"} · {doc.pageCount} page{doc.pageCount > 1 ? "s" : ""}
+                </div>
+                <div className="actions" style={{ marginTop: 16 }}>
+                  <button className="btn btn-primary btn-lg" onClick={run}>
+                    Run process <ArrowRight size={18} />
+                  </button>
+                  <button className="btn btn-lg" onClick={() => fileInput.current?.click()}>
+                    Choose another file
+                  </button>
                 </div>
               </div>
-            ) : doc ? (
-              <div className="dz-doc">
-                <img src={doc.pageImages[0]} alt="Selected invoice" className="dz-thumb" />
-                <div>
-                  <div className="dz-name">{doc.fileName}</div>
-                  <div className="muted small">
-                    {doc.hasTextLayer ? "Digital PDF · text layer found" : doc.mimeType === "application/pdf" ? "Scanned PDF · read from the image" : "Photo / image · read from the image"} · {doc.pageCount} page{doc.pageCount > 1 ? "s" : ""}
-                  </div>
-                  <div className="link small" style={{ marginTop: 8 }}>
-                    Replace file
-                  </div>
-                </div>
-              </div>
-            ) : (
-              <div className="dz-empty">
-                <div className="dz-icon">{Icon.process}</div>
-                <div className="dz-title">Drop an invoice here, or click to browse</div>
-                <div className="muted small">PDF (digital or scanned) or a photo · up to 3 pages are read</div>
-              </div>
-            )}
-          </div>
-          {error && (
-            <div className="alert alert-err" role="alert" style={{ marginTop: 12 }}>
-              {error}
+            </div>
+          ) : (
+            <div className="drop-empty">
+              <span className="drop-icon">
+                <UploadCloud size={30} />
+              </span>
+              <div className="drop-title">Drag & drop an invoice here</div>
+              <div className="muted">PDF (digital or scanned), JPG, PNG or WEBP · up to 3 pages are read</div>
+              <button className="btn btn-primary" onClick={() => fileInput.current?.click()}>
+                Browse files
+              </button>
             </div>
           )}
-          <div className="intake-go">
-            <button className="btn btn-primary btn-xl" onClick={run} disabled={!doc || preparing}>
-              Run process {Icon.arrow}
-            </button>
-            <span className="muted small">8 controls · decision in ~10–40 s</span>
+        </div>
+        {error && (
+          <div className="alert alert-err" role="alert">
+            {error}
           </div>
-        </section>
+        )}
 
-        <aside className="intake-samples" aria-label="Demo invoices">
-          <div className="eyebrow">Or pick a demo invoice</div>
-          <ul className="samples">
-            {SAMPLES.map((s, i) => (
-              <li key={s.file}>
-                <button className={`sample ${activeSample === s.file ? "on" : ""}`} onClick={() => loadSample(s)} disabled={preparing}>
-                  <span className="sample-n">{i + 1}</span>
-                  <span className="sample-body">
-                    <span className="sample-title">{s.title}</span>
-                    <span className="sample-desc">{s.scenario}</span>
-                  </span>
-                  <StatusBadge status={resolutionToStatus(s.expect)} />
-                </button>
-              </li>
-            ))}
-          </ul>
-          <p className="muted small">Expected outcome shown on the right; each runs through the real pipeline.</p>
-        </aside>
+        <section className="demos">
+          <button className="demos-toggle" aria-expanded={showDemos} onClick={() => setShowDemos((v) => !v)}>
+            <span>
+              <b>Try a demo invoice</b> <span className="muted">· six realistic scenarios, each runs through the real pipeline</span>
+            </span>
+            <ChevronDown size={18} className={showDemos ? "rot" : ""} />
+          </button>
+          {showDemos && (
+            <div className="demo-grid">
+              {SAMPLES.map((s) => {
+                const I = KIND_ICON[s.kind];
+                const [vendor, ref] = s.title.split(" · ");
+                return (
+                  <button key={s.file} className={`demo ${activeSample === s.file ? "on" : ""}`} onClick={() => loadSample(s)} disabled={preparing || running}>
+                    <span className={`demo-icon k-${s.kind.split(" ")[0].toLowerCase()}`}>
+                      <I size={18} />
+                    </span>
+                    <span className="demo-body">
+                      <span className="demo-vendor">{vendor}</span>
+                      <span className="demo-kind">
+                        {s.kind} · {ref}
+                      </span>
+                      <span className="demo-desc">{s.scenario}</span>
+                      <span className="demo-exp">
+                        <span className="muted">Demo expectation</span> <StatusBadge status={resolutionToStatus(s.expect)} />
+                      </span>
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </section>
       </div>
     </Shell>
   );

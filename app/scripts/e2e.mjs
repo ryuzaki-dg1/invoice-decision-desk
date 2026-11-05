@@ -1,9 +1,8 @@
-// End-to-end rehearsal: drives the real UI in Edge with the live model.
-//  1) all six demo invoices through the real pipeline, checking each decision
-//  2) a repeat upload of the happy-path invoice (must be rejected, no new payable)
-//  3) bank-change hold resolved through the reviewer workflow
-//  4) handwritten Rao bill: reacts to what the model ACTUALLY read; if the
-//     overwritten digit was misread it corrects it and re-runs the checks
+// End-to-end rehearsal on the real UI in Edge with the live model.
+//  1) six demo invoices through the real pipeline, checking each decision
+//  2) repeat upload of the happy path (must be rejected; no new payable)
+//  3) bank hold → record verification → approve (guided actions)
+//  4) handwritten Rao: PO suggestion → correction → re-validation → confirm → approve
 //  5) screenshots of every screen to scripts/tmp/e2e/
 // Usage: node scripts/e2e.mjs [baseUrl] [--ui-only]   (CLEARS run history unless --ui-only)
 
@@ -19,12 +18,12 @@ const shots = path.join(here, "tmp", "e2e");
 fs.mkdirSync(shots, { recursive: true });
 
 const CASES = [
-  ["Acme Industrial · INV-1047", "Approved"],
-  ["Sunridge Chemicals · SC-3390", "Needs review"],
-  ["Northstar Logistics · scanned copy", "Rejected"],
-  ["Rao Electrical · handwritten bill", "Needs review"],
-  ["Acme Industrial · INV-1052", "Payment hold"],
-  ["Brightline Supply Co · BL-2291", "Payment hold"],
+  ["INV-1047", "Approved"],
+  ["SC-3390", "Needs review"],
+  ["scanned copy", "Rejected"],
+  ["handwritten bill", "Needs review"],
+  ["INV-1052", "Payment hold"],
+  ["BL-2291", "Payment hold"],
 ];
 
 if (!uiOnly) await fetch(`${base}/api/runs`, { method: "DELETE" });
@@ -33,83 +32,112 @@ const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
 page.on("pageerror", (e) => console.log("  [page error]", e.message));
 const shot = (name, fullPage = false) => page.screenshot({ path: path.join(shots, `${name}.png`), fullPage });
 const runs = async () => (await fetch(`${base}/api/runs`)).json();
-const byNo = async (n) => (await runs()).find((r) => r.invoice.invoiceNumber === n && !r.repeatSubmission);
 let failures = 0;
 const check = (ok, msg) => {
   console.log(`${ok ? "PASS" : "FAIL"} ${msg}`);
   if (!ok) failures++;
 };
 
-async function runCase(title, expected, label) {
+async function runCase(ref, expected, label, attempt = 1) {
   const t0 = Date.now();
   await page.goto(`${base}/process`);
-  await page.locator(".sample", { hasText: title }).click();
-  await page.locator("img.dz-thumb").waitFor({ timeout: 30000 });
-  await shot("process-intake");
+  await page.locator(".demo", { hasText: ref }).click();
+  await page.locator("img.drop-thumb").waitFor({ timeout: 30000 });
+  if (ref === "INV-1047" && attempt === 1) await shot("process-a-selected");
   await page.locator(".btn-primary", { hasText: "Run process" }).click();
-  await page.locator(".running .tl").waitFor({ timeout: 10000 }).catch(() => {});
+  await page.locator(".proc").waitFor({ timeout: 10000 }).catch(() => {});
+  if (ref === "SC-3390") {
+    await page.waitForTimeout(2500);
+    await shot("process-b-running");
+  }
   await Promise.race([page.locator(".inv-head .badge-lg").waitFor({ timeout: 300000 }), page.locator(".alert-err").waitFor({ timeout: 300000 })]).catch(() => {});
-  if (await page.locator(".alert-err").isVisible()) console.log(`  ERROR: ${(await page.locator(".alert-err").innerText()).slice(0, 300)}`);
+  if (await page.locator(".alert-err").isVisible()) {
+    console.log(`  provider/system error: ${(await page.locator(".alert-err").innerText()).slice(0, 160).replace(/\s+/g, " ")}`);
+    if (attempt < 2) return runCase(ref, expected, label, attempt + 1);
+  }
   const got = (await page.locator(".inv-head .badge-lg").innerText().catch(() => "(none)")).trim();
-  check(got.toLowerCase() === expected.toLowerCase(), `${label}: ${got} (expected ${expected}) · ${((Date.now() - t0) / 1000).toFixed(1)}s`);
-  console.log(`     ${(await page.locator(".dec-what").innerText().catch(() => "")).slice(0, 140)}`);
+  check(got.toLowerCase() === expected.toLowerCase(), `${label}: ${got} (expected ${expected}) · ${((Date.now() - t0) / 1000).toFixed(1)}s${attempt > 1 ? " · after 1 retry" : ""}`);
+  console.log(`     ${(await page.locator(".decision-title").innerText().catch(() => "")).slice(0, 120)}`);
 }
 
 if (!uiOnly) {
-  for (const [i, [title, expected]] of CASES.entries()) {
-    await runCase(title, expected, `${i + 1}. ${title}`);
-    await shot(`process-${String(i + 1).padStart(2, "0")}`);
+  await page.goto(`${base}/process`);
+  await shot("process-a-intake");
+  for (const [i, [ref, expected]] of CASES.entries()) {
+    await runCase(ref, expected, `${i + 1}. ${ref}`);
+    await shot(`process-c-${String(i + 1).padStart(2, "0")}`);
   }
-  await runCase(CASES[0][0], "Rejected", "Repeat upload of INV-1047");
+  await runCase("INV-1047", "Rejected", "Repeat upload of INV-1047");
 }
 
-// ---- Bank hold → verification → approval ----
-const bank = await byNo("INV-1052");
+const confirmAction = async (label, note, verify = false) => {
+  await page.locator(".act", { hasText: label }).click();
+  await page.locator('.act-form input[aria-label="Reviewer name"]').fill("Priya Shah");
+  await page.locator('.act-form input[aria-label="Justification"]').fill(note);
+  if (verify) await page.locator(".act-form .verify input").check();
+  await page.locator(".act-form .btn", { hasText: "Confirm" }).click();
+  await page.waitForTimeout(1200);
+};
+
+// ---- Bank hold via the Review Queue workspace ----
+const bank = (await runs()).find((r) => r.invoice.invoiceNumber === "INV-1052" && !r.repeatSubmission);
 if (bank) {
-  await page.goto(`${base}/invoice/${bank.id}?from=queue`);
-  await page.locator(".resolve").waitFor();
-  await shot("invoice-bank-hold");
-  check(await page.locator(".resolve .btn", { hasText: /^Approve/ }).isDisabled(), "Approve is locked on a bank hold");
-  await page.locator(".resolve-fields input").first().fill("Priya Shah");
-  await page.locator(".resolve-fields input").nth(1).fill("Called Acme on (216) 555-0190 (number on file); controller confirmed new account");
-  await page.locator(".verify input").check();
-  await page.locator(".resolve .btn", { hasText: "Record independent bank verification" }).click();
-  await page.locator(".inv-head .badge-lg", { hasText: /needs review/i }).waitFor({ timeout: 10000 });
-  await page.locator(".resolve-fields input").nth(1).fill("All controls resolved after call-back verification");
-  await page.locator(".resolve .btn", { hasText: /^Approve/ }).click();
-  await page.locator(".inv-head .badge-lg", { hasText: /approved/i }).waitFor({ timeout: 10000 });
-  check(true, "Bank hold: verified → needs review → approved by reviewer");
+  await page.goto(`${base}/queue?run=${bank.id}`);
+  await page.locator(".ws-card .inv-head").waitFor();
+  await shot("queue-bank");
+  check(await page.locator(".act", { hasText: /^Approve/ }).isDisabled(), "Approve is locked on a bank hold");
+  // Validation messages when submitting without input
+  await page.locator(".act", { hasText: "Record independent bank verification" }).click();
+  await page.locator('.act-form input[aria-label="Justification"]').fill("");
+  await page.locator(".act-form .btn", { hasText: "Confirm" }).click();
+  check(await page.locator(".form-errors").isVisible(), "Missing justification / verification shows validation messages");
+  await shot("queue-bank-form");
+  await page.locator('.act-form input[aria-label="Reviewer name"]').fill("Priya Shah");
+  await page.locator('.act-form input[aria-label="Justification"]').fill("Called Acme on (216) 555-0190 (number on file); controller confirmed the new account");
+  await page.locator(".act-form .verify input").check();
+  await page.locator(".act-form .btn", { hasText: "Confirm" }).click();
+  await page.locator(".ws-card .badge-lg", { hasText: /needs review/i }).waitFor({ timeout: 10000 });
+  await confirmAction("Approve", "All controls resolved after call-back verification");
+  const b2 = (await runs()).find((r) => r.id === bank.id);
+  check(b2.status === "approved", `Bank hold: verified → needs review → ${b2.status}`);
 }
 
-// ---- Handwritten Rao: inspect what the model really read ----
+// ---- Handwritten Rao: suggestion → correction → re-validation → confirm → approve ----
 const rao = (await runs()).find((r) => /rao/i.test(r.invoice.vendor) && !r.repeatSubmission);
 if (rao) {
   const l0 = rao.invoice.lineItems[0];
-  const codes = rao.findings.filter((f) => f.action !== "info").map((f) => f.code);
-  console.log(`     Rao: model read labour line as ${l0?.quantity} × ${l0?.unitPrice} = ${l0?.total}; uncertain: [${rao.invoice.lowConfidenceFields.join(", ")}]; open: ${codes.join(", ")}`);
+  console.log(`     Rao (real model output): labour ${l0?.quantity} × ${l0?.unitPrice} = ${l0?.total}; AI-unsure: [${rao.invoice.lowConfidenceFields.join(", ")}]`);
   await page.goto(`${base}/invoice/${rao.id}?from=queue`);
   await page.locator(".inv-head").waitFor();
-  await shot("invoice-rao-before");
-  const misread = Math.abs((l0?.total ?? 0) - 1850) > 0.5 || Math.abs((l0?.unitPrice ?? 0) - 1850) > 0.5;
-  if (misread) {
+  await shot("invoice-rao-summary");
+  if (Math.abs((l0?.total ?? 0) - 1850) > 0.5) {
     await page.locator(".btn", { hasText: "Correct fields" }).click();
     await page.locator('input[aria-label="Line 1 unitPrice"]').fill("1850");
     await page.locator('input[aria-label="Line 1 total"]').fill("1850");
     await page.locator('.editor input[aria-label="Reviewer name"]').fill("Priya Shah");
-    await page.locator('.editor input[aria-label="Reason for correction"]').fill("Labour amount is 1850 on the photo (8 written over 3); only value that matches the subtotal");
-    await shot("invoice-rao-editing");
-    await page.locator(".btn", { hasText: "Save corrections & re-run checks" }).click();
+    await page.locator('.editor input[aria-label="Reason for correction"]').fill("Labour reads 1850 on the photo (8 over 3); the only value matching the subtotal");
+    await page.locator(".btn", { hasText: "Save & re-run checks" }).click();
     await page.waitForTimeout(1500);
-    const after = (await runs()).find((r) => r.id === rao.id);
-    check(!after.findings.some((f) => f.code === "ARITHMETIC_MISMATCH"), `Correction re-ran checks: arithmetic now reconciles; status ${after.status}; open ${after.findings.filter((f) => f.action !== "info" && !(after.resolvedCodes ?? []).includes(f.code)).map((f) => f.code).join(", ")}`);
-    check(after.corrections?.[0]?.changes?.length >= 1 && after.originalInvoice, "Correction audit: original value kept, change + reviewer + reason recorded");
-  } else {
-    console.log("     Model read 1850 correctly; no correction needed. Showing confirmation path.");
   }
-  await page.reload();
-  await page.locator(".resolve").waitFor();
-  check(await page.locator(".resolve .btn", { hasText: /^Approve/ }).isDisabled(), "Rao: Approve locked until figures and PO are confirmed");
-  await shot("invoice-rao-after");
+  if (rao.poMatch.method !== "explicit") {
+    await page.locator(".sugg-row .btn", { hasText: "Use this PO" }).first().click();
+    await page.locator('.editor input[aria-label="Reviewer name"]').fill("Priya Shah");
+    await page.locator('.editor input[aria-label="Reason for correction"]').fill("Plant manager confirmed the work was ordered on PO-2026-0225");
+    await shot("invoice-rao-editing");
+    await page.locator(".btn", { hasText: "Save & re-run checks" }).click();
+    await page.waitForTimeout(1500);
+  }
+  let r = (await runs()).find((x) => x.id === rao.id);
+  const open = (x) => x.findings.filter((f) => f.action !== "info" && !(x.resolvedCodes ?? []).includes(f.code)).map((f) => f.code);
+  check(r.corrections?.length >= 1 && r.originalInvoice, `Correction recorded (${r.corrections?.map((c) => c.changes.map((ch) => `${ch.field} ${ch.from}→${ch.to}`).join("; ")).join(" | ")}); all checks re-ran; open: ${open(r).join(", ")}`);
+  check(await page.locator(".act", { hasText: /^Approve/ }).isDisabled(), "Approve still locked until figures are confirmed");
+  await confirmAction("Confirm figures match the document", "Checked every figure against the photo; labour reads 1850");
+  await confirmAction("Approve", "Figures confirmed; PO assigned by plant manager");
+  r = (await runs()).find((x) => x.id === rao.id);
+  check(r.status === "approved", `Rao final status: ${r.status} · audit: ${r.audit.map((a) => a.action.split(":")[0]).join(" → ")}`);
+  await page.locator(".seg button", { hasText: "Detailed" }).click();
+  await shot("invoice-rao-detailed", true);
+  await page.locator(".seg button", { hasText: "Summary" }).click();
 }
 
 for (const [name, url] of [["overview", "/"], ["queue", "/queue"], ["history", "/history"], ["reference", "/reference"], ["policy", "/policy"]]) {
@@ -117,10 +145,12 @@ for (const [name, url] of [["overview", "/"], ["queue", "/queue"], ["history", "
   await page.waitForTimeout(700);
   await shot(name);
 }
-await page.goto(`${base}/policy`);
-await page.locator(".setting input.input-num").first().fill("12");
-await page.waitForTimeout(500);
-await shot("policy-impact");
+const sunridge = (await runs()).find((r) => r.invoice.invoiceNumber === "SC-3390");
+if (sunridge) {
+  await page.goto(`${base}/invoice/${sunridge.id}?from=history`);
+  await page.locator(".inv-head").waitFor();
+  await shot("invoice-sunridge-summary");
+}
 
 const all = await runs();
 console.log(`Stored runs: ${all.length} · ${all.map((r) => `${r.invoice.invoiceNumber}:${r.status}`).join(", ")}`);

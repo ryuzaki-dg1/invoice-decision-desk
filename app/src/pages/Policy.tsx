@@ -1,141 +1,159 @@
 import { useEffect, useMemo, useState } from "react";
+import { ChevronDown, Lock, RotateCcw, Save } from "lucide-react";
 import { REASON_LABEL } from "../copy";
-import { isOpen, resolutionLabel } from "../lib/engine";
+import { isOpen } from "../lib/engine";
 import { evaluate } from "../lib/revalidate";
 import { DEFAULT_RULES, loadRules, saveRules, type Rules } from "../lib/rules";
 import { Shell } from "../Shell";
 import type { ExceptionCode } from "../types";
 import { StatusBadge, resolutionToStatus, useRuns, useToast } from "../ui";
 
-type Field = { k: keyof Rules; name: string; desc: string; scale?: number; step?: number; unit: string };
+type NumField = { k: keyof Rules; name: string; desc: string; scale?: number; step?: number; unit: string; fmt: (v: number) => string };
+const pct = (v: number) => `${(v * 100).toFixed(2).replace(/\.00$/, "")}%`;
+const usd = (v: number) => `$${v.toLocaleString("en-US")}`;
 
-const GROUPS: { title: string; sub: string; fields: Field[]; fixed?: string[] }[] = [
-  {
-    title: "Matching",
-    sub: "How closely an invoice must match its purchase order.",
-    fields: [
-      { k: "amountTolerancePct", name: "PO amount tolerance", desc: "Cumulative billing may exceed the PO value by at most this much.", scale: 100, step: 0.5, unit: "%" },
-      { k: "priceTolerancePct", name: "Unit price tolerance", desc: "Invoice unit price vs PO unit price.", scale: 100, step: 0.5, unit: "%" },
-      { k: "quantityTolerance", name: "Quantity tolerance", desc: "Units billed beyond the PO quantity, across all invoices.", unit: "units" },
-      { k: "arithmeticToleranceAbs", name: "Arithmetic rounding", desc: "Allowed rounding when totals are re-added. PO tolerance never excuses arithmetic.", step: 0.5, unit: "$" },
-    ],
-  },
-  {
-    title: "Fraud & security",
-    sub: "Controls that stop payment. The fixed ones cannot be relaxed from the UI.",
-    fields: [{ k: "duplicateWindowDays", name: "Possible-duplicate window", desc: "Same vendor and same amount within this window is flagged.", unit: "days" }],
-    fixed: ["Bank account differs from vendor master → payment hold, needs recorded call-back verification", "Vendor not in vendor master → payment hold until onboarded", "Same vendor + same invoice number → rejected, no second payable"],
-  },
-  {
-    title: "Human review",
-    sub: "When a person must look, even if every check passes.",
-    fields: [{ k: "autoApproveLimit", name: "Auto-approval limit", desc: "Invoices above this always get a reviewer.", step: 1000, unit: "$" }],
-  },
+const MATCHING: NumField[] = [
+  { k: "amountTolerancePct", name: "PO amount tolerance", desc: "How far cumulative billing may exceed the PO value.", scale: 100, step: 0.5, unit: "%", fmt: pct },
+  { k: "priceTolerancePct", name: "Unit price tolerance", desc: "How far the invoice unit price may exceed the PO price.", scale: 100, step: 0.5, unit: "%", fmt: pct },
+  { k: "quantityTolerance", name: "Quantity tolerance", desc: "Extra units allowed beyond the PO quantity, across all invoices.", unit: "units", fmt: (v) => `${v} units` },
+  { k: "arithmeticToleranceAbs", name: "Arithmetic rounding", desc: "Rounding allowed when the invoice totals are re-added.", step: 0.5, unit: "$", fmt: (v) => `$${v.toFixed(2)}` },
 ];
+const RISK: NumField[] = [{ k: "duplicateWindowDays", name: "Duplicate detection window", desc: "Same vendor and same amount within this window is flagged.", unit: "days", fmt: (v) => `${v} days` }];
+const REVIEW: NumField[] = [{ k: "autoApproveLimit", name: "Auto-approval threshold", desc: "Invoices above this amount always get a reviewer.", step: 1000, unit: "$", fmt: usd }];
 
 const PRECEDENCE: { status: "rejected" | "payment_hold" | "needs_review" | "approved"; when: string; codes: ExceptionCode[] }[] = [
   { status: "rejected", when: "Confirmed duplicate or blocked vendor", codes: ["DUPLICATE_INVOICE", "VENDOR_BLOCKED"] },
   { status: "payment_hold", when: "Security or vendor-identity risk", codes: ["BANK_ACCOUNT_MISMATCH", "UNKNOWN_VENDOR", "PO_VENDOR_MISMATCH"] },
-  { status: "needs_review", when: "Human judgement or correction needed", codes: ["ARITHMETIC_MISMATCH", "MISSING_FIELD", "PO_MATCH_UNCONFIRMED", "CUMULATIVE_PO_EXCEEDED", "PENDING_PO_CONFLICT", "PO_AMOUNT_EXCEEDED", "QUANTITY_EXCEEDS_PO", "PRICE_VARIANCE", "LOW_EXTRACTION_CONFIDENCE", "HANDWRITTEN_DOCUMENT", "EXPIRED_PO", "POSSIBLE_DUPLICATE", "OVER_APPROVAL_LIMIT"] },
+  { status: "needs_review", when: "Needs judgement or correction", codes: ["ARITHMETIC_MISMATCH", "MISSING_FIELD", "PO_MATCH_UNCONFIRMED", "CUMULATIVE_PO_EXCEEDED", "PENDING_PO_CONFLICT", "PO_AMOUNT_EXCEEDED", "QUANTITY_EXCEEDS_PO", "PRICE_VARIANCE", "LOW_EXTRACTION_CONFIDENCE", "HANDWRITTEN_DOCUMENT", "EXPIRED_PO", "POSSIBLE_DUPLICATE", "OVER_APPROVAL_LIMIT"] },
   { status: "approved", when: "Every mandatory check passes", codes: ["WITHIN_TOLERANCE", "PARTIAL_BILLING", "VENDOR_NAME_VARIANT", "SCANNED_DOCUMENT"] },
 ];
 
 export default function Policy() {
   const { runs } = useRuns();
-  const [rules, setRules] = useState<Rules>(() => loadRules());
   const [saved, setSaved] = useState<Rules>(() => loadRules());
+  const [rules, setRules] = useState<Rules>(saved);
   const [toast, notify] = useToast();
   useEffect(() => saveRules(saved), [saved]);
   const dirty = JSON.stringify(rules) !== JSON.stringify(saved);
 
-  // Impact preview: re-run the deterministic checks on every stored invoice
-  // with the run's own thresholds and with the draft thresholds, and compare.
+  // Impact preview: re-run the deterministic checks on stored invoices with
+  // each run's own thresholds vs the draft, and list decisions that change.
   const impact = useMemo(() => {
     if (!dirty) return [];
     return runs
       .filter((r) => !r.repeatSubmission)
-      .map((r) => {
-        const base = { ...DEFAULT_RULES, ...(r.rules ?? {}) };
-        const before = evaluate(r.invoice, base, r, runs).decision.resolution;
-        const after = evaluate(r.invoice, rules, r, runs).decision.resolution;
-        return { r, before, after };
-      })
+      .map((r) => ({ r, before: evaluate(r.invoice, { ...DEFAULT_RULES, ...(r.rules ?? {}) }, r, runs).decision.resolution, after: evaluate(r.invoice, rules, r, runs).decision.resolution }))
       .filter((x) => x.before !== x.after);
   }, [rules, runs, dirty]);
 
-  const field = (f: Field) => (
-    <label key={f.k} className="setting">
-      <div>
-        <div className="setting-name">{f.name}</div>
-        <div className="setting-desc">
-          {f.desc} <span className="muted">Default {Number(DEFAULT_RULES[f.k]) * (f.scale ?? 1)} {f.unit}.</span>
+  const num = (f: NumField) => {
+    const changed = rules[f.k] !== saved[f.k];
+    return (
+      <div key={f.k} className="set">
+        <div className="set-text">
+          <div className="set-name">
+            {f.name} {changed && <span className="pill pill-warn">Unsaved</span>}
+          </div>
+          <div className="set-desc">{f.desc}</div>
+        </div>
+        <div className="set-ctl">
+          <input
+            className="input input-num"
+            type="number"
+            aria-label={f.name}
+            step={f.step ?? 1}
+            value={Number(rules[f.k]) * (f.scale ?? 1)}
+            onChange={(e) => setRules({ ...rules, [f.k]: Number(e.target.value) / (f.scale ?? 1) })}
+          />
+          <span className="unit">{f.unit}</span>
+        </div>
+        <div className="set-cur">
+          Default {f.fmt(Number(DEFAULT_RULES[f.k]))}
         </div>
       </div>
-      <div className="setting-ctl">
-        <input className="input input-num" type="number" step={f.step ?? 1} value={Number(rules[f.k]) * (f.scale ?? 1)} onChange={(e) => setRules({ ...rules, [f.k]: Number(e.target.value) / (f.scale ?? 1) })} />
-        <span className="unit">{f.unit}</span>
+    );
+  };
+  const locked = (name: string, desc: string) => (
+    <div className="set">
+      <div className="set-text">
+        <div className="set-name">{name}</div>
+        <div className="set-desc">{desc}</div>
       </div>
-    </label>
+      <div className="set-ctl">
+        <span className="toggle on locked" aria-label={`${name}: always on`}>
+          <span />
+        </span>
+      </div>
+      <div className="set-cur">
+        <Lock size={12} /> Always on
+      </div>
+    </div>
   );
 
   return (
     <Shell page="policy" openCount={runs.filter((r) => isOpen(r.status)).length}>
       <header className="page-head">
         <div>
-          <div className="eyebrow">Policy rules</div>
-          <h1 className="display-sm">The rules that govern automation</h1>
-          <p className="muted">The AI reads and explains. These deterministic controls decide. Thresholds apply to new runs from this browser.</p>
+          <h1 className="h1">Policy rules</h1>
+          <p className="sub">The deterministic controls that decide every invoice. The AI reads and explains; these rules decide.</p>
         </div>
         <div className="actions">
-          <button className="btn" onClick={() => setRules(DEFAULT_RULES)}>
-            Restore defaults
+          <button className="btn" onClick={() => setRules(DEFAULT_RULES)} disabled={JSON.stringify(rules) === JSON.stringify(DEFAULT_RULES)}>
+            <RotateCcw size={15} /> Reset to defaults
           </button>
-          <button className="btn btn-primary" disabled={!dirty} onClick={() => (setSaved(rules), notify("Policy saved; applies to new runs"))}>
-            Save policy
+          <button className="btn btn-primary" disabled={!dirty} onClick={() => (setSaved(rules), notify("Policy saved · applies to new invoices"))}>
+            <Save size={15} /> Save changes
           </button>
         </div>
       </header>
 
       <div className="policy">
-        <div className="surface">
-          {GROUPS.map((g) => (
-            <section key={g.title} className="pgroup">
-              <h2>{g.title}</h2>
-              <p className="muted small">{g.sub}</p>
-              {g.fields.map(field)}
-              {g.title === "Human review" && (
-                <label className="setting">
-                  <div>
-                    <div className="setting-name">Always review handwritten invoices</div>
-                    <div className="setting-desc">A single misread digit changes the amount paid. Default on.</div>
-                  </div>
-                  <div className="setting-ctl">
-                    <input type="checkbox" className="switch" checked={rules.reviewHandwritten} onChange={(e) => setRules({ ...rules, reviewHandwritten: e.target.checked })} />
-                  </div>
-                </label>
-              )}
-              {g.fixed?.map((t) => (
-                <div key={t} className="setting setting-fixed">
-                  <div className="setting-name">{t}</div>
-                  <span className="tag tag-ok">Always on</span>
+        <div className="card">
+          <section className="pgroup">
+            <h2 className="h2">Matching rules</h2>
+            <p className="muted small">How closely an invoice must match its purchase order.</p>
+            {MATCHING.map(num)}
+          </section>
+          <section className="pgroup">
+            <h2 className="h2">Risk & security</h2>
+            <p className="muted small">Controls that stop payment. Security controls can't be switched off.</p>
+            {RISK.map(num)}
+            {locked("Bank account verification", "A remit-to account that differs from the vendor record puts the invoice on payment hold until a call-back is recorded.")}
+            {locked("Unknown vendor control", "Payees not in the vendor master are held until procurement onboards them.")}
+          </section>
+          <section className="pgroup">
+            <h2 className="h2">Human review</h2>
+            <p className="muted small">When a person must look, even if every check passes.</p>
+            {REVIEW.map(num)}
+            <div className="set">
+              <div className="set-text">
+                <div className="set-name">
+                  Handwritten document review {rules.reviewHandwritten !== saved.reviewHandwritten && <span className="pill pill-warn">Unsaved</span>}
                 </div>
-              ))}
-            </section>
-          ))}
+                <div className="set-desc">Always send handwritten invoices to a reviewer. A single misread digit changes the amount paid.</div>
+              </div>
+              <div className="set-ctl">
+                <button className={`toggle ${rules.reviewHandwritten ? "on" : ""}`} role="switch" aria-checked={rules.reviewHandwritten} aria-label="Handwritten document review" onClick={() => setRules({ ...rules, reviewHandwritten: !rules.reviewHandwritten })}>
+                  <span />
+                </button>
+              </div>
+              <div className="set-cur">{rules.reviewHandwritten ? "On" : "Off"} · default on</div>
+            </div>
+          </section>
         </div>
 
-        <div className="policy-side">
-          <section className="surface pad">
-            <h2>Impact preview</h2>
+        <aside className="policy-side">
+          <section className="card pad">
+            <h2 className="h3">Impact preview</h2>
             {!dirty ? (
-              <p className="muted small">Change a threshold to see which stored invoices would get a different decision. Computed by re-running the rules on {runs.filter((r) => !r.repeatSubmission).length} stored invoices.</p>
+              <p className="muted small">Change a setting to see which of the {runs.filter((r) => !r.repeatSubmission).length} stored invoices would get a different decision. Computed by re-running the rules.</p>
             ) : impact.length === 0 ? (
-              <p className="small">No stored invoice would change decision. Security controls are unaffected by thresholds.</p>
+              <p className="small">No stored invoice would change decision. Security controls aren't affected by thresholds.</p>
             ) : (
               <ul className="impact">
                 {impact.map(({ r, before, after }) => (
                   <li key={r.id}>
-                    <span className="strong">{r.vendorMatched ?? r.invoice.vendor}</span> <span className="mono muted">{r.invoice.invoiceNumber}</span>
+                    <div className="strong">{r.vendorMatched ?? r.invoice.vendor}</div>
                     <div className="impact-row">
                       <StatusBadge status={resolutionToStatus(before)} /> → <StatusBadge status={resolutionToStatus(after)} />
                     </div>
@@ -143,27 +161,27 @@ export default function Policy() {
                 ))}
               </ul>
             )}
-            {dirty && <p className="muted small">Preview only. Saved policy applies to new runs; existing decisions are not rewritten.</p>}
+            {dirty && <p className="muted small">Saved changes apply to new invoices; existing decisions are not rewritten.</p>}
           </section>
-          <section className="surface pad">
-            <h2>Decision precedence</h2>
-            <p className="muted small">Every finding is kept; the strictest one decides.</p>
+          <details className="card pad prec-box">
+            <summary>
+              <h2 className="h3">Decision precedence</h2>
+              <ChevronDown size={16} />
+            </summary>
+            <p className="muted small">All findings are kept; the strictest one decides.</p>
             <ol className="prec">
               {PRECEDENCE.map((p) => (
                 <li key={p.status}>
                   <StatusBadge status={p.status} />
                   <div>
-                    <div className="strong">{p.when}</div>
+                    <div className="strong small">{p.when}</div>
                     <div className="muted small">{p.codes.map((c) => REASON_LABEL[c]).join(" · ")}</div>
                   </div>
                 </li>
               ))}
             </ol>
-            <p className="muted small">
-              Reviewer gates: bank holds need a recorded call-back; suggested POs need confirmation; handwritten figures need confirmation; invoices that don't reconcile can't be approved; unknown vendors can't be approved here. Labels: {resolutionLabel("AUTO_APPROVE")} means eligible for payment, not paid.
-            </p>
-          </section>
-        </div>
+          </details>
+        </aside>
       </div>
       {toast}
     </Shell>

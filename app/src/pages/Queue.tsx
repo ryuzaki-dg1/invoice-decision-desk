@@ -1,92 +1,75 @@
-// Review workspace: master list grouped by what the analyst must DO, detail
-// pane with the selected invoice's decision, evidence and resolution.
+// Review workspace: compact list of invoices needing action (30%) and the
+// selected invoice's decision, evidence and guided resolution (70%).
 
 import { useEffect, useMemo, useState } from "react";
-import { ACTION_GROUPS, REASON_LABEL, requiredAction } from "../copy";
+import { CircleCheckBig, Inbox } from "lucide-react";
+import { ACTION_GROUPS } from "../copy";
 import { Investigation } from "../investigation";
 import { money } from "../lib/engine";
-import { openCodes } from "../lib/review";
 import { Shell } from "../Shell";
-import { prioritise } from "../tables";
-import { SkeletonRows, timeAgo, topFinding, useRuns, useToast } from "../ui";
+import { AttentionRow, prioritise } from "../tables";
+import { Empty, SkeletonRows, useRuns, useToast } from "../ui";
 
 export default function Queue() {
   const { runs, loaded, replace } = useRuns();
   const [toast, notify] = useToast();
+  const [filter, setFilter] = useState<string>("all");
   const [selectedId, setSelectedId] = useState<string | null>(() => new URLSearchParams(window.location.search).get("run"));
-  const queue = prioritise(runs);
-  const groups = useMemo(
-    () =>
-      ACTION_GROUPS.map((g) => ({ ...g, items: queue.filter((r) => requiredAction(r, openCodes(r)) === g.key) })).filter((g) => g.items.length),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [runs],
-  );
+  const queue = useMemo(() => prioritise(runs), [runs]);
+  const groups = ACTION_GROUPS.map((g) => ({ ...g, n: queue.filter((q) => q.actionKey === g.key).length })).filter((g) => g.n > 0);
+  const shown = filter === "all" ? queue : queue.filter((q) => q.actionKey === filter);
   useEffect(() => {
-    if (!selectedId && queue[0]) setSelectedId(queue[0].id);
-  }, [queue, selectedId]);
+    if (loaded && !selectedId && shown[0]) setSelectedId(shown[0].id);
+  }, [loaded, selectedId, shown]);
   const selected = runs.find((r) => r.id === selectedId) ?? null;
   const value = queue.reduce((s, r) => s + (r.invoice.total ?? 0), 0);
 
   return (
-    <Shell page="queue" openCount={queue.length}>
+    <Shell page="queue" openCount={queue.length} wide>
       <div className="ws">
-        <aside className="ws-list" aria-label="Open exceptions">
-          <div className="ws-list-head">
-            <h1 className="display-sm">Review workspace</h1>
+        <aside className="ws-list card" aria-label="Invoices requiring action">
+          <div className="ws-head">
+            <h1 className="h2">Review queue</h1>
             <p className="muted small">
-              {queue.length} open · {money(value)} waiting · grouped by the action needed, highest priority first
+              {queue.length} open · {money(value)} waiting
             </p>
           </div>
-          {!loaded ? (
-            <SkeletonRows />
-          ) : groups.length === 0 ? (
-            <div className="empty">
-              <div className="empty-title">Queue is clear</div>
-              Nothing needs a decision. <a href="/process">Process an invoice →</a>
+          {groups.length > 0 && (
+            <div className="chips chips-wrap" role="group" aria-label="Filter by action">
+              <button className={`chip ${filter === "all" ? "on" : ""}`} aria-pressed={filter === "all"} onClick={() => setFilter("all")}>
+                All <span>{queue.length}</span>
+              </button>
+              {groups.map((g) => (
+                <button key={g.key} className={`chip ${filter === g.key ? "on" : ""}`} aria-pressed={filter === g.key} onClick={() => setFilter(g.key)} title={g.hint}>
+                  {g.label} <span>{g.n}</span>
+                </button>
+              ))}
             </div>
-          ) : (
-            groups.map((g) => (
-              <div key={g.key} className="ws-group">
-                <div className="ws-group-head">
-                  <span>{g.label}</span>
-                  <b>{g.items.length}</b>
-                </div>
-                <div className="ws-group-hint">{g.hint}</div>
-                {g.items.map((r) => {
-                  const f = topFinding(r);
-                  return (
-                    <button key={r.id} className={`ws-item ws-${r.status} ${selectedId === r.id ? "on" : ""}`} onClick={() => setSelectedId(r.id)} aria-current={selectedId === r.id}>
-                      <span className="ws-item-top">
-                        <span className="ws-vendor">{r.vendorMatched ?? r.invoice.vendor}</span>
-                        <span className="ws-amt">{money(r.invoice.total, r.invoice.currency)}</span>
-                      </span>
-                      <span className="ws-item-sub">
-                        <span className="mono">{r.invoice.invoiceNumber ?? "—"}</span> · {f ? REASON_LABEL[f.code] : "Review"} · {timeAgo(r.createdAt)}
-                      </span>
-                    </button>
-                  );
-                })}
-              </div>
-            ))
           )}
+          <div className="ws-items">
+            {!loaded ? (
+              <SkeletonRows />
+            ) : shown.length === 0 ? (
+              <Empty icon={<CircleCheckBig size={22} />} title={queue.length ? "Nothing in this filter" : "Queue is clear"}>
+                {queue.length ? "Choose another filter." : <a href="/process">Process an invoice</a>}
+              </Empty>
+            ) : (
+              shown.map((r) => <AttentionRow key={r.id} r={r} compact selected={r.id === selectedId} onOpen={() => setSelectedId(r.id)} />)
+            )}
+          </div>
+          <p className="ws-foot muted small">Ordered by severity, then amount, then waiting time.</p>
         </aside>
         <section className="ws-detail" aria-live="polite">
           {selected ? (
-            <Investigation
-              key={selected.id}
-              run={selected}
-              allRuns={runs}
-              embedded
-              onUpdated={replace}
-              notify={notify}
-              breadcrumb={
-                <>
-                  <span>{queue.find((q) => q.id === selected.id)?.why ?? "Closed case"}</span> · <a href={`/invoice/${selected.id}?from=queue`}>Open with document →</a>
-                </>
-              }
-            />
+            <div className="card ws-card">
+              <Investigation key={selected.id} run={selected} allRuns={runs} embedded onUpdated={replace} notify={notify} />
+            </div>
           ) : (
-            <div className="empty">Select an invoice to review.</div>
+            <div className="card">
+              <Empty icon={<Inbox size={22} />} title="Select an invoice">
+                Pick an item on the left to see what happened and what to do.
+              </Empty>
+            </div>
           )}
         </section>
       </div>

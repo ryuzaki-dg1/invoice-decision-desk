@@ -16,6 +16,7 @@
     "make-samples": "node scripts/make-samples.mjs"
   },
   "dependencies": {
+    "lucide-react": "^1.69.0",
     "pdfjs-dist": "^4.10.38",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",

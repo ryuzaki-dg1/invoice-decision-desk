@@ -124,7 +124,7 @@ export function PoEvidence({ run }: { run: RunRecord }) {
         <span className="tabnum">{b.remainingAfter >= 0 ? `${money(b.remainingAfter, c)} left on PO` : `${money(-b.remainingAfter, c)} over PO`}</span>
       </div>
       {lines && lines.some((l) => l.status !== "ok" || l.priorQty > 0) && (
-        <table className="dense" style={{ marginTop: 12 }}>
+        <table className="tbl tbl-sm" style={{ marginTop: 12 }}>
           <thead>
             <tr>
               <th>Line</th>

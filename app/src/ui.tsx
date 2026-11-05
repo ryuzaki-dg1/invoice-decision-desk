@@ -1,26 +1,35 @@
-// Small shared UI primitives and hooks.
+// Shared UI primitives and hooks.
 
 import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { CheckCircle2, CircleAlert, CirclePause, Clock3, Scale, Sparkles, XCircle, X } from "lucide-react";
 import { statusLabel } from "./lib/engine";
 import { fetchRuns } from "./lib/runsApi";
 import type { CaseStatus, CheckAction, Resolution, RunRecord } from "./types";
 
-// Validated as a set for charts; always shown with a text label.
 export const STATUS_COLOR: Record<CaseStatus, string> = {
-  approved: "#2e7d50",
-  needs_review: "#d6a22a",
-  awaiting_info: "#d6a22a",
-  payment_hold: "#c4501f",
-  rejected: "#a0215c",
+  approved: "#059669",
+  needs_review: "#D97706",
+  awaiting_info: "#D97706",
+  payment_hold: "#EA580C",
+  rejected: "#DC2626",
+};
+
+const STATUS_ICON: Record<CaseStatus, typeof CheckCircle2> = {
+  approved: CheckCircle2,
+  needs_review: CircleAlert,
+  awaiting_info: Clock3,
+  payment_hold: CirclePause,
+  rejected: XCircle,
 };
 
 export const resolutionToStatus = (r: Resolution): CaseStatus =>
   r === "AUTO_APPROVE" ? "approved" : r === "REJECT" ? "rejected" : r === "ESCALATE" ? "payment_hold" : "needs_review";
 
 export function StatusBadge({ status, large }: { status: CaseStatus; large?: boolean }) {
+  const I = STATUS_ICON[status];
   return (
     <span className={`badge st-${status} ${large ? "badge-lg" : ""}`}>
-      <i aria-hidden /> {statusLabel(status)}
+      <I size={large ? 16 : 13} strokeWidth={2.4} aria-hidden /> {statusLabel(status)}
     </span>
   );
 }
@@ -32,43 +41,46 @@ export const SEVERITY: Record<CheckAction, { label: string; rank: number }> = {
   info: { label: "Info", rank: 0 },
 };
 
-export function Severity({ action }: { action: CheckAction }) {
-  return <span className={`sev sev-${action}`}>{SEVERITY[action].label}</span>;
+export function SeverityDot({ action, withLabel }: { action: CheckAction; withLabel?: boolean }) {
+  return (
+    <span className={`sevdot sev-${action}`} title={`${SEVERITY[action].label} severity`}>
+      <i aria-hidden />
+      {withLabel && SEVERITY[action].label}
+    </span>
+  );
 }
 
-// Most severe finding that is still open (reviewer-resolved controls excluded).
+// Makes "who did what" explicit everywhere: AI reads, rules decide.
+export function Attribution({ kind, children }: { kind: "ai" | "rules" | "human"; children?: ReactNode }) {
+  return (
+    <span className={`attr attr-${kind}`}>
+      {kind === "ai" ? <Sparkles size={13} aria-hidden /> : <Scale size={13} aria-hidden />}
+      {children ?? (kind === "ai" ? "Read by AI" : kind === "rules" ? "Decided by rules" : "Reviewer")}
+    </span>
+  );
+}
+
 export function topFinding(run: RunRecord) {
   const resolved = new Set(run.resolvedCodes ?? []);
   return run.findings.filter((f) => f.action !== "info" && !resolved.has(f.code)).sort((a, b) => SEVERITY[b.action].rank - SEVERITY[a.action].rank)[0];
 }
 
-// Short "why" for tables, consistent with the current status.
-export function primaryReason(run: RunRecord, label: (f: NonNullable<ReturnType<typeof topFinding>>) => string): string {
-  const reviewer = [...run.audit].reverse().find((e) => e.kind === "reviewer");
-  if (run.status === "approved") return reviewer ? `Cleared by ${reviewer.actor}` : "All checks passed";
-  if (run.status === "rejected" && reviewer) return `Rejected by ${reviewer.actor}`;
-  const f = topFinding(run);
-  return f ? label(f) : "—";
-}
-
 export function useRuns() {
   const [runs, setRuns] = useState<RunRecord[]>([]);
   const [loaded, setLoaded] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const reload = useCallback(() => {
-    return fetchRuns()
-      .then((r) => {
-        setRuns(r);
-        setError(null);
-      })
-      .catch((e) => setError((e as Error).message))
-      .finally(() => setLoaded(true));
-  }, []);
+  const reload = useCallback(
+    () =>
+      fetchRuns()
+        .then(setRuns)
+        .catch(() => setRuns([]))
+        .finally(() => setLoaded(true)),
+    [],
+  );
   useEffect(() => {
     reload();
   }, [reload]);
   const replace = useCallback((r: RunRecord) => setRuns((prev) => prev.map((x) => (x.id === r.id ? r : x))), []);
-  return { runs, loaded, error, reload, replace, setRuns };
+  return { runs, loaded, reload, replace, setRuns };
 }
 
 // One demo reviewer identity shared by every panel on the page.
@@ -90,14 +102,13 @@ export function useReviewer(): [string, (s: string) => void] {
   ];
 }
 
-// Decision view (default) vs Detailed view; remembered per browser.
-export function useViewMode(): ["decision" | "detailed", (v: "decision" | "detailed") => void] {
-  const [v, setV] = useState<"decision" | "detailed">(() => (localStorage.getItem("view_mode") === "detailed" ? "detailed" : "decision"));
+export function useDensity(): ["summary" | "detailed", (v: "summary" | "detailed") => void] {
+  const [v, setV] = useState<"summary" | "detailed">(() => (localStorage.getItem("density") === "detailed" ? "detailed" : "summary"));
   return [
     v,
     (n) => {
       setV(n);
-      localStorage.setItem("view_mode", n);
+      localStorage.setItem("density", n);
     },
   ];
 }
@@ -106,22 +117,44 @@ export function useToast(): [ReactNode, (msg: string, kind?: "ok" | "err") => vo
   const [t, setT] = useState<{ msg: string; kind: "ok" | "err" } | null>(null);
   useEffect(() => {
     if (!t) return;
-    const id = setTimeout(() => setT(null), 3200);
+    const id = setTimeout(() => setT(null), 3600);
     return () => clearTimeout(id);
   }, [t]);
   const node = t ? (
     <div className={`toast ${t.kind === "err" ? "toast-err" : ""}`} role="status">
-      {t.msg}
+      {t.kind === "err" ? <XCircle size={16} /> : <CheckCircle2 size={16} />} {t.msg}
     </div>
   ) : null;
   return [node, (msg, kind = "ok") => setT({ msg, kind })];
 }
 
-export function Empty({ title, children }: { title: string; children?: ReactNode }) {
+export function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: ReactNode }) {
+  useEffect(() => {
+    const k = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    window.addEventListener("keydown", k);
+    return () => window.removeEventListener("keydown", k);
+  }, [onClose]);
+  return (
+    <div className="modal-wrap" onClick={onClose}>
+      <div className="modal" role="dialog" aria-modal="true" aria-label={title} onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <span>{title}</span>
+          <button className="icon-btn" aria-label="Close" onClick={onClose}>
+            <X size={18} />
+          </button>
+        </div>
+        <div className="modal-body">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+export function Empty({ icon, title, children }: { icon?: ReactNode; title: string; children?: ReactNode }) {
   return (
     <div className="empty">
+      {icon && <div className="empty-icon">{icon}</div>}
       <div className="empty-title">{title}</div>
-      {children}
+      {children && <div className="empty-sub">{children}</div>}
     </div>
   );
 }
@@ -138,67 +171,13 @@ export function SkeletonRows({ n = 4 }: { n?: number }) {
 
 export function timeAgo(ms: number): string {
   const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
-  if (s < 60) return `${s}s`;
+  if (s < 60) return "just now";
   const m = Math.round(s / 60);
-  if (m < 60) return `${m} min`;
+  if (m < 60) return `${m} min ago`;
   const h = Math.round(m / 60);
-  if (h < 48) return `${h} h`;
-  return `${Math.round(h / 24)} d`;
+  if (h < 48) return `${h} h ago`;
+  return `${Math.round(h / 24)} d ago`;
 }
 
 export const fmtDate = (ms: number) => new Date(ms).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
-
-// ---- Icons (inline, 16px) ----
-const I = (d: ReactNode) => (
-  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-    {d}
-  </svg>
-);
-export const Icon = {
-  overview: I(
-    <>
-      <rect x="3" y="3" width="7" height="9" rx="1.5" />
-      <rect x="14" y="3" width="7" height="5" rx="1.5" />
-      <rect x="14" y="12" width="7" height="9" rx="1.5" />
-      <rect x="3" y="16" width="7" height="5" rx="1.5" />
-    </>,
-  ),
-  process: I(
-    <>
-      <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
-      <path d="M14 3v5h5M12 17v-6M9 14l3-3 3 3" />
-    </>,
-  ),
-  queue: I(
-    <>
-      <path d="M4 5h16M4 12h10M4 19h7" />
-      <circle cx="18" cy="17" r="3" />
-    </>,
-  ),
-  history: I(
-    <>
-      <path d="M3 12a9 9 0 1 0 3-6.7L3 8" />
-      <path d="M3 3v5h5M12 7v5l3 3" />
-    </>,
-  ),
-  data: I(
-    <>
-      <ellipse cx="12" cy="5" rx="8" ry="3" />
-      <path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3" />
-    </>,
-  ),
-  policy: I(
-    <>
-      <path d="M12 3l8 3v6c0 4.5-3.4 8.3-8 9-4.6-.7-8-4.5-8-9V6z" />
-      <path d="M9 12l2 2 4-4" />
-    </>,
-  ),
-  search: I(
-    <>
-      <circle cx="11" cy="11" r="7" />
-      <path d="M21 21l-4.3-4.3" />
-    </>,
-  ),
-  arrow: I(<path d="M5 12h14M13 6l6 6-6 6" />),
-  close: I(<path d="M6 6l12 12M18 6L6 18" />),
-};
+export const fmtSecs = (ms: number) => (ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} s`);

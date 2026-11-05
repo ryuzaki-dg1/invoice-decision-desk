@@ -1,17 +1,23 @@
 import { useMemo } from "react";
+import { ArrowRight, CircleCheckBig, FileText, Inbox, Plus, Wallet, Zap } from "lucide-react";
 import { REASON_LABEL } from "../copy";
-import { isOpen, money, resolutionLabel } from "../lib/engine";
+import { isOpen, money, statusLabel } from "../lib/engine";
 import { Shell } from "../Shell";
-import { RunsTable, go, prioritise } from "../tables";
+import { AttentionRow, go, prioritise } from "../tables";
 import type { CaseStatus, ExceptionCode } from "../types";
-import { Icon, STATUS_COLOR, SkeletonRows, useRuns } from "../ui";
+import { Empty, STATUS_COLOR, SkeletonRows, StatusBadge, fmtSecs, timeAgo, useRuns } from "../ui";
 
-const MIX: { key: CaseStatus; label: string; icon: string }[] = [
-  { key: "approved", label: "Approved", icon: "✓" },
-  { key: "needs_review", label: "Needs review", icon: "!" },
-  { key: "payment_hold", label: "Payment hold", icon: "■" },
-  { key: "rejected", label: "Rejected", icon: "✕" },
+const DIST: { key: CaseStatus; label: string }[] = [
+  { key: "approved", label: "Approved" },
+  { key: "needs_review", label: "Needs review" },
+  { key: "payment_hold", label: "Payment hold" },
+  { key: "rejected", label: "Rejected" },
 ];
+
+function greeting(): string {
+  const h = new Date().getHours(); // browser local time
+  return h < 12 ? "Good morning" : h < 17 ? "Good afternoon" : "Good evening";
+}
 
 export default function Overview() {
   const { runs, loaded } = useRuns();
@@ -19,167 +25,163 @@ export default function Overview() {
 
   const m = useMemo(() => {
     const total = runs.length;
-    const repeats = runs.filter((r) => r.repeatSubmission).length;
     const eligible = runs.filter((r) => !r.repeatSubmission);
     const stp = eligible.filter((r) => r.decision.resolution === "AUTO_APPROVE").length;
-    const openRuns = runs.filter((r) => isOpen(r.status));
-    const openValue = openRuns.reduce((s, r) => s + (r.invoice.total ?? 0), 0);
-    const holds = runs.filter((r) => r.status === "payment_hold").length;
+    const open = runs.filter((r) => isOpen(r.status));
+    const openValue = open.reduce((s, r) => s + (r.invoice.total ?? 0), 0);
     const avgMs = total ? runs.reduce((s, r) => s + r.durationMs, 0) / total : 0;
     const bucket = (s: CaseStatus): CaseStatus => (s === "awaiting_info" ? "needs_review" : s);
-    const mix = MIX.map((x) => ({ ...x, n: runs.filter((r) => bucket(r.status) === x.key).length }));
+    const dist = DIST.map((d) => ({ ...d, n: runs.filter((r) => bucket(r.status) === d.key).length }));
     const reasons = new Map<ExceptionCode, number>();
     for (const r of runs) for (const c of new Set(r.findings.filter((x) => x.action !== "info").map((x) => x.code))) reasons.set(c, (reasons.get(c) ?? 0) + 1);
-    const top = [...reasons.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5);
-    return { total, repeats, eligible: eligible.length, stp, openCount: openRuns.length, openValue, holds, avgMs, mix, top };
+    const top = [...reasons.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4);
+    return { total, repeats: total - eligible.length, eligible: eligible.length, stp, open: open.length, holds: open.filter((r) => r.status === "payment_hold").length, openValue, avgMs, dist, top };
   }, [runs]);
 
-  const today = new Date().toLocaleDateString([], { weekday: "long", day: "numeric", month: "long" });
-  const headline = !loaded ? "Loading…" : m.openCount === 0 ? "Nothing needs your attention" : `${m.openCount} invoice${m.openCount > 1 ? "s" : ""} need${m.openCount > 1 ? "" : "s"} your attention`;
-
   return (
-    <Shell page="overview" openCount={m.openCount}>
-      <header className="hero">
+    <Shell page="overview" openCount={m.open}>
+      <header className="page-head">
         <div>
-          <div className="eyebrow">{today} · Accounts payable</div>
-          <h1 className="display">{headline}</h1>
-          <p className="hero-sub">
-            {m.openCount ? (
-              <>
-                <strong>{money(m.openValue)}</strong> is waiting on a decision{m.holds ? `, including ${m.holds} payment hold${m.holds > 1 ? "s" : ""}` : ""}. Everything else is cleared or closed.
-              </>
-            ) : (
-              "Every processed invoice is approved or closed."
-            )}
-          </p>
+          <h1 className="h1">{greeting()}, AP team</h1>
+          <p className="sub">Here's what needs your attention today.</p>
         </div>
         <a className="btn btn-primary btn-lg" href="/process">
-          Process invoice {Icon.arrow}
+          <Plus size={18} /> Process invoice
         </a>
       </header>
 
-      <div className="stats">
-        <Stat k="Processed" v={String(m.total)} s={m.repeats ? `${m.repeats} repeat submission${m.repeats > 1 ? "s" : ""}` : "unique submissions"} />
-        <Stat k="Straight-through" v={m.eligible ? `${Math.round((m.stp / m.eligible) * 100)}%` : "—"} s={`${m.stp} of ${m.eligible} with no human touch`} />
-        <Stat k="Awaiting review" v={String(m.openCount)} s="review, hold or awaiting vendor" />
-        <Stat k="Requiring intervention" v={money(m.openValue)} s="unresolved invoices only" />
-        <Stat k="Avg. time to decision" v={m.total ? `${(m.avgMs / 1000).toFixed(1)} s` : "—"} s="upload to decision" />
+      <div className="kpis">
+        <Kpi icon={<FileText size={18} />} tone="indigo" label="Invoices processed" value={String(m.total)} sub={m.repeats ? `incl. ${m.repeats} repeat submission${m.repeats > 1 ? "s" : ""}` : "unique submissions"} />
+        <Kpi icon={<Zap size={18} />} tone="teal" label="Straight-through processing" value={m.eligible ? `${Math.round((m.stp / m.eligible) * 100)}%` : "—"} sub={`${m.stp} of ${m.eligible} approved with no human touch`} />
+        <Kpi icon={<Inbox size={18} />} tone="amber" label="Awaiting action" value={String(m.open)} sub={m.holds ? `${m.holds} on payment hold` : "in the review queue"} />
+        <Kpi icon={<Wallet size={18} />} tone="orange" label="Value requiring intervention" value={money(m.openValue)} sub="unresolved invoices only" />
       </div>
 
-      <section className="surface">
-        <div className="surface-head">
-          <div>
-            <h2>Priority queue</h2>
-            <p className="muted small">Ordered by severity, then amount at stake, then time waiting.</p>
+      <div className="home">
+        <div className="home-left">
+        <section className="card">
+          <div className="card-head">
+            <div>
+              <h2 className="h2">Needs your attention</h2>
+              <p className="muted small">Most severe first, then largest amount, then longest waiting.</p>
+            </div>
+            {queue.length > 0 && (
+              <a className="btn btn-sm" href="/queue">
+                Open review queue <ArrowRight size={14} />
+              </a>
+            )}
           </div>
-          <a className="btn btn-sm" href="/queue">
-            Open review workspace
-          </a>
+          {!loaded ? (
+            <SkeletonRows />
+          ) : queue.length === 0 ? (
+            <Empty icon={<CircleCheckBig size={22} />} title="You're all caught up">
+              Nothing is waiting on a decision. <a href="/process">Process an invoice</a>
+            </Empty>
+          ) : (
+            <div className="arows">
+              {queue.slice(0, 6).map((r) => (
+                <AttentionRow key={r.id} r={r} onOpen={() => (window.location.href = `/queue?run=${r.id}`)} />
+              ))}
+            </div>
+          )}
+        </section>
+        <RecentActivity runs={runs} loaded={loaded} />
         </div>
-        {!loaded ? (
-          <SkeletonRows />
-        ) : queue.length === 0 ? (
-          <div className="empty">
-            <div className="empty-title">Queue is clear</div>
-            <a href="/process">Process an invoice →</a>
-          </div>
-        ) : (
-          <ol className="pq">
-            {queue.slice(0, 6).map((r, i) => {
-              const f = r.findings.find((x) => x.action !== "info" && !(r.resolvedCodes ?? []).includes(x.code));
-              return (
-                <li key={r.id} className={`pq-row pq-${r.status}`} tabIndex={0} onClick={() => go(r.id, "overview")} onKeyDown={(e) => e.key === "Enter" && go(r.id, "overview")}>
-                  <span className="pq-rank">{i + 1}</span>
-                  <div className="pq-main">
-                    <div className="pq-top">
-                      <span className="pq-vendor">{r.vendorMatched ?? r.invoice.vendor}</span>
-                      <span className="mono muted">{r.invoice.invoiceNumber ?? "no invoice no."}</span>
-                      {i === 0 && <span className="tag tag-hold">Highest priority</span>}
-                    </div>
-                    <div className="pq-reason">{f ? REASON_LABEL[f.code] : resolutionLabel(r.decision.resolution)} — <span className="muted">{r.action}</span></div>
-                    <div className="pq-why">{r.why}</div>
-                  </div>
-                  <div className="pq-amt">{money(r.invoice.total, r.invoice.currency)}</div>
-                  <span className="pq-go">Open {Icon.arrow}</span>
-                </li>
-              );
-            })}
-          </ol>
-        )}
-      </section>
 
-      <div className="split-2">
-        <section className="surface">
-          <div className="surface-head">
-            <h2>Decisions</h2>
-            <span className="muted small">current status of {m.total} invoice{m.total === 1 ? "" : "s"}</span>
+        <section className="card health">
+          <div className="card-head">
+            <h2 className="h2">Processing health</h2>
           </div>
-          {m.total ? (
-            <div className="pad">
-              <div className="mix" role="img" aria-label={m.mix.map((x) => `${x.label} ${x.n}`).join(", ")}>
-                {m.mix
-                  .filter((x) => x.n)
-                  .map((x) => (
-                    <span key={x.key} style={{ flexGrow: x.n, background: STATUS_COLOR[x.key] }} title={`${x.label}: ${x.n} (${Math.round((x.n / m.total) * 100)}%)`} />
-                  ))}
+          <div className="health-body">
+            <div className="health-top">
+              <div>
+                <div className="big">{m.eligible ? `${Math.round((m.stp / m.eligible) * 100)}%` : "—"}</div>
+                <div className="muted small">automation rate</div>
               </div>
-              <div className="mix-legend">
-                {m.mix.map((x) => (
-                  <div key={x.key}>
-                    <i style={{ background: STATUS_COLOR[x.key] }} />
-                    <span className="muted" aria-hidden>
-                      {x.icon}
+              <div>
+                <div className="big big-2">{m.total ? fmtSecs(m.avgMs) : "—"}</div>
+                <div className="muted small">avg. time to decision</div>
+              </div>
+            </div>
+            <h3 className="h3">Decisions</h3>
+            {m.total ? (
+              <div className="dist">
+                {m.dist.map((d) => (
+                  <div key={d.key} className="dist-row" title={`${d.label}: ${d.n}`}>
+                    <span className="dist-l">{d.label}</span>
+                    <span className="dist-track">
+                      <span style={{ width: `${(d.n / m.total) * 100}%`, background: STATUS_COLOR[d.key] }} />
                     </span>
-                    {x.label}
-                    <b>{x.n}</b>
-                    <span className="muted tabnum">{Math.round((x.n / m.total) * 100)}%</span>
+                    <span className="dist-n">{d.n}</span>
+                    <span className="dist-p">{Math.round((d.n / m.total) * 100)}%</span>
                   </div>
                 ))}
               </div>
-            </div>
-          ) : (
-            <div className="pad muted small">No invoices yet.</div>
-          )}
-        </section>
-        <section className="surface">
-          <div className="surface-head">
-            <h2>Most frequent exceptions</h2>
-            <span className="muted small">invoices affected</span>
-          </div>
-          <div className="pad bars">
-            {m.top.length ? (
-              m.top.map(([code, n]) => (
-                <div key={code} className="bar" title={`${REASON_LABEL[code]}: ${n}`}>
-                  <span>{REASON_LABEL[code]}</span>
-                  <span className="bar-track">
-                    <span style={{ width: `${(n / m.top[0][1]) * 100}%` }} />
-                  </span>
-                  <b>{n}</b>
-                </div>
-              ))
             ) : (
-              <span className="muted small">None recorded.</span>
+              <p className="muted small">No invoices yet.</p>
+            )}
+            <h3 className="h3">Most common exceptions</h3>
+            {m.top.length ? (
+              <ol className="topex">
+                {m.top.map(([c, n]) => (
+                  <li key={c}>
+                    <span>{REASON_LABEL[c]}</span>
+                    <b>{n}</b>
+                  </li>
+                ))}
+              </ol>
+            ) : (
+              <p className="muted small">None recorded.</p>
             )}
           </div>
         </section>
       </div>
-
-      <section className="surface">
-        <div className="surface-head">
-          <h2>Recent activity</h2>
-        </div>
-        <RunsTable runs={runs} loaded={loaded} from="overview" limit={8} />
-      </section>
     </Shell>
   );
 }
 
-function Stat({ k, v, s }: { k: string; v: string; s: string }) {
+function RecentActivity({ runs, loaded }: { runs: ReturnType<typeof useRuns>["runs"]; loaded: boolean }) {
   return (
-    <div className="stat">
-      <div className="stat-k">{k}</div>
-      <div className="stat-v">{v}</div>
-      <div className="stat-s">{s}</div>
+      <section className="card">
+        <div className="card-head">
+          <h2 className="h2">Recent activity</h2>
+          <a className="small" href="/history">
+            View history
+          </a>
+        </div>
+        {!loaded ? (
+          <SkeletonRows n={3} />
+        ) : runs.length === 0 ? (
+          <Empty title="No activity yet" />
+        ) : (
+          <ul className="feed">
+            {runs.slice(0, 6).map((r) => (
+              <li key={r.id} tabIndex={0} onClick={() => go(r.id, "overview")} onKeyDown={(e) => e.key === "Enter" && go(r.id, "overview")}>
+                <span className="feed-dot" style={{ background: STATUS_COLOR[r.status] }} />
+                <span className="feed-text">
+                  <b>{r.vendorMatched ?? r.invoice.vendor}</b> <span className="mono muted">{r.invoice.invoiceNumber}</span> · {statusLabel(r.status).toLowerCase()}
+                  {r.audit.some((e) => e.kind === "reviewer") ? ` by ${[...r.audit].reverse().find((e) => e.kind === "reviewer")!.actor}` : " by rules"}
+                </span>
+                <span className="feed-amt">{money(r.invoice.total, r.invoice.currency)}</span>
+                <StatusBadge status={r.status} />
+                <span className="feed-time">{timeAgo(r.audit.at(-1)?.at ?? r.createdAt)}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+  );
+}
+
+function Kpi({ icon, tone, label, value, sub }: { icon: React.ReactNode; tone: string; label: string; value: string; sub: string }) {
+  return (
+    <div className="kpi">
+      <span className={`kpi-icon kpi-${tone}`}>{icon}</span>
+      <div>
+        <div className="kpi-label">{label}</div>
+        <div className="kpi-value">{value}</div>
+        <div className="kpi-sub">{sub}</div>
+      </div>
     </div>
   );
 }

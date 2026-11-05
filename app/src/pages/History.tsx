@@ -1,3 +1,4 @@
+import { RotateCcw } from "lucide-react";
 import { isOpen } from "../lib/engine";
 import { resetRuns } from "../lib/runsApi";
 import { Shell } from "../Shell";
@@ -11,9 +12,8 @@ export default function History() {
     <Shell page="history" openCount={runs.filter((r) => isOpen(r.status)).length}>
       <header className="page-head">
         <div>
-          <div className="eyebrow">Invoice history</div>
-          <h1 className="display-sm">What happened to every invoice</h1>
-          <p className="muted">Each row opens the full decision, evidence, corrections and audit trail.</p>
+          <h1 className="h1">Invoice history</h1>
+          <p className="sub">Every submission and its decision. Open one to see the evidence and audit trail.</p>
         </div>
         <button
           className="btn"
@@ -24,10 +24,10 @@ export default function History() {
             notify("Demo data reset");
           }}
         >
-          Reset demo data
+          <RotateCcw size={15} /> Reset demo data
         </button>
       </header>
-      <section className="surface">
+      <section className="card">
         <RunsTable runs={runs} loaded={loaded} from="history" />
       </section>
       {toast}

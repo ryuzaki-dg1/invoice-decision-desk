@@ -1,6 +1,7 @@
 // Plain-language labels and "why it matters" text for each rule code, written
 // for an AP executive. Amounts come from the run; nothing here is invented.
 
+import { VENDORS } from "./data/vendors";
 import { money } from "./lib/engine";
 import type { ExceptionCode, RunRecord } from "./types";
 
@@ -35,15 +36,64 @@ export const REASON_LABEL: Record<ExceptionCode, string> = {
   OVER_APPROVAL_LIMIT: "Above auto-approval limit",
 };
 
+// One plain-language line per rule, for summaries. Details live in Detailed view.
+export const SHORT: Partial<Record<ExceptionCode, string>> = {
+  BANK_ACCOUNT_MISMATCH: "The account on this invoice doesn't match the approved vendor record.",
+  UNKNOWN_VENDOR: "This payee isn't in the approved vendor list.",
+  DUPLICATE_INVOICE: "This invoice is already on file. Paying it would pay the same bill twice.",
+  CUMULATIVE_PO_EXCEEDED: "Together with earlier invoices, this bills more than the PO allows.",
+  PO_AMOUNT_EXCEEDED: "The invoice is above the PO value, beyond tolerance.",
+  QUANTITY_EXCEEDS_PO: "More units are billed than were ordered.",
+  PRICE_VARIANCE: "The unit price is higher than agreed on the PO.",
+  PO_MATCH_UNCONFIRMED: "No PO is printed. A likely PO was suggested and needs confirming.",
+  MISSING_PO_REFERENCE: "No PO is printed and none fits the invoice.",
+  UNKNOWN_PO: "The PO number on the invoice doesn't exist.",
+  ARITHMETIC_MISMATCH: "The numbers on the invoice don't add up.",
+  MISSING_FIELD: "Required details are missing from the invoice.",
+  HANDWRITTEN_DOCUMENT: "Handwritten invoice. A person confirms the figures before approval.",
+  LOW_EXTRACTION_CONFIDENCE: "Some figures couldn't be read with certainty.",
+  EXPIRED_PO: "The PO has expired and needs re-authorisation.",
+  POSSIBLE_DUPLICATE: "Same vendor and amount as a recent invoice with a different number.",
+  PENDING_PO_CONFLICT: "Another unapproved invoice is competing for the same PO.",
+  OVER_APPROVAL_LIMIT: "Above the auto-approval limit, so a person signs off.",
+  PO_VENDOR_MISMATCH: "The PO belongs to a different vendor.",
+};
+
+// The shortest correct instruction for what to do next.
+export function nextStep(run: RunRecord, open: ExceptionCode[]): string {
+  if (run.status === "approved") return "Eligible for the next payment run. Not yet paid.";
+  if (run.status === "rejected") return "Nothing to do. No payable was created.";
+  const v = VENDORS.find((x) => x.id === run.vendorId);
+  const po = run.poMatch.po;
+  switch (requiredAction(run, open)) {
+    case "bank":
+      return `Verify the bank change by calling ${v ? `${v.name} on ${v.phone}` : "the vendor"}, the contact already on file.`;
+    case "onboard":
+      return "Send the vendor to procurement for onboarding. It can't be approved until then.";
+    case "fields":
+      return "Check the highlighted figures against the original, then correct or confirm them.";
+    case "po":
+      return po ? `Confirm ${po.id} with ${po.approvedBy}, or assign the right PO.` : "Ask the requester which PO this invoice belongs to.";
+    case "po_amount":
+      return run.decision.nextAction.replace(/^\d\.\s*/, "").split(/ \d\. /)[0];
+    case "dup":
+      return "Ask the vendor whether this re-issues an invoice already on file.";
+    case "waiting":
+      return "Waiting for the vendor's reply.";
+    default:
+      return "Review the findings, then approve with a justification or reject.";
+  }
+}
+
 // What the analyst has to DO next, derived from the open controls. The queue
 // groups by this instead of by status.
 export type ActionKey = "bank" | "onboard" | "fields" | "po" | "po_amount" | "dup" | "review" | "waiting";
 export const ACTION_GROUPS: { key: ActionKey; label: string; hint: string }[] = [
-  { key: "bank", label: "Verify bank details", hint: "Call the trusted contact on file before releasing" },
-  { key: "onboard", label: "Onboard vendor", hint: "Payee is not in the vendor master" },
-  { key: "fields", label: "Correct or confirm fields", hint: "Handwritten, uncertain or inconsistent figures" },
+  { key: "bank", label: "Verify payment details", hint: "Call the trusted contact on file before releasing" },
+  { key: "onboard", label: "Vendor onboarding", hint: "Payee is not in the vendor master" },
+  { key: "fields", label: "Confirm extracted data", hint: "Handwritten, uncertain or inconsistent figures" },
   { key: "po", label: "Confirm PO", hint: "No PO printed; a match is only suggested" },
-  { key: "po_amount", label: "Resolve PO discrepancy", hint: "Over PO value, quantity or price" },
+  { key: "po_amount", label: "Resolve PO mismatch", hint: "Over PO value, quantity or price" },
   { key: "dup", label: "Check possible duplicate", hint: "Same vendor and amount as a recent invoice" },
   { key: "review", label: "Review and approve", hint: "Judgement call with justification" },
   { key: "waiting", label: "Waiting on vendor", hint: "Clarification requested" },

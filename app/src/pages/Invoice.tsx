@@ -5,7 +5,7 @@ import { Empty, SkeletonRows, useRuns, useToast } from "../ui";
 
 const BACK: Record<string, [string, string]> = {
   queue: ["/queue", "Review queue"],
-  history: ["/history", "Invoices"],
+  history: ["/history", "Invoice history"],
   process: ["/process", "Process invoice"],
   overview: ["/", "Overview"],
 };
@@ -18,32 +18,26 @@ export default function InvoicePage({ id }: { id: string }) {
   const [backHref, backLabel] = BACK[from] ?? BACK.history;
   const page = from === "queue" ? "queue" : from === "overview" ? "overview" : "history";
   const openCount = runs.filter((r) => isOpen(r.status)).length;
-
+  const crumbs = (
+    <>
+      <a href={backHref}>{backLabel}</a>
+      <span>/</span>
+      <span className="crumb-cur">{run?.invoice.invoiceNumber ?? run?.fileName ?? "Invoice"}</span>
+    </>
+  );
   if (!loaded || !run) {
     return (
       <Shell page={page} openCount={openCount}>
-        <div className="crumbs">
-          <a href={backHref}>{backLabel}</a>
-        </div>
-        <div className="surface" style={{ marginTop: 12 }}>
+        <div className="crumbs">{crumbs}</div>
+        <div className="card" style={{ marginTop: 16 }}>
           {loaded ? <Empty title="Invoice not found">It may have been cleared with “Reset demo data”.</Empty> : <SkeletonRows n={6} />}
         </div>
       </Shell>
     );
   }
   return (
-    <Shell page={page} openCount={openCount}>
-      <Investigation
-        run={run}
-        allRuns={runs}
-        onUpdated={replace}
-        notify={notify}
-        breadcrumb={
-          <>
-            <a href={backHref}>{backLabel}</a> / <span>{run.invoice.invoiceNumber ?? run.fileName}</span>
-          </>
-        }
-      />
+    <Shell page={page} openCount={openCount} wide>
+      <Investigation run={run} allRuns={runs} onUpdated={replace} notify={notify} breadcrumb={crumbs} />
       {toast}
     </Shell>
   );
