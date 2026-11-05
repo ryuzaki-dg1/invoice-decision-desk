@@ -1,78 +1,25 @@
 import { useMemo, useState } from "react";
-import { REASON_LABEL } from "./copy";
+import { ACTION_GROUPS, REASON_LABEL, requiredAction } from "./copy";
 import { isOpen, money } from "./lib/engine";
+import { openCodes } from "./lib/review";
 import type { CaseStatus, RunRecord } from "./types";
-import { Empty, Icon, SEVERITY, Severity, SkeletonRows, StatusBadge, fmtDate, primaryReason, timeAgo, topFinding } from "./ui";
+import { Empty, Icon, SEVERITY, SkeletonRows, StatusBadge, fmtDate, primaryReason, timeAgo, topFinding } from "./ui";
 
-const go = (id: string, from?: string) => {
+export const go = (id: string, from?: string) => {
   window.location.href = `/invoice/${id}${from ? `?from=${from}` : ""}`;
 };
 
-// Open exceptions, most severe first, then oldest first.
-export function attentionOrder(runs: RunRecord[]): RunRecord[] {
+// Transparent priority: severity first, then money at stake, then time waiting.
+export function prioritise(runs: RunRecord[]): (RunRecord & { why: string; action: string })[] {
   return runs
     .filter((r) => isOpen(r.status))
-    .sort((a, b) => {
-      const sa = SEVERITY[topFinding(a)?.action ?? "info"].rank;
-      const sb = SEVERITY[topFinding(b)?.action ?? "info"].rank;
-      return sb - sa || a.createdAt - b.createdAt;
-    });
-}
-
-export function AttentionTable({ runs, loaded, from, showAge = true }: { runs: RunRecord[]; loaded: boolean; from: string; showAge?: boolean }) {
-  if (!loaded) return <SkeletonRows />;
-  if (!runs.length)
-    return (
-      <Empty title="Nothing needs your attention">
-        Every processed invoice is either approved or closed. <a href="/process">Process an invoice →</a>
-      </Empty>
-    );
-  return (
-    <div className="table-wrap">
-      <table className="table table-click">
-        <thead>
-          <tr>
-            <th>Invoice</th>
-            <th className="num">Amount</th>
-            <th>Exception</th>
-            <th>Severity</th>
-            <th>Recommended action</th>
-            <th>Status</th>
-            {showAge && <th>Waiting</th>}
-            <th />
-          </tr>
-        </thead>
-        <tbody>
-          {runs.map((r) => {
-            const f = topFinding(r);
-            return (
-              <tr key={r.id} onClick={() => go(r.id, from)}>
-                <td>
-                  <div className="cell-strong">{r.vendorMatched ?? r.invoice.vendor}</div>
-                  <div className="cell-sub mono">{r.invoice.invoiceNumber ?? "no invoice #"}</div>
-                </td>
-                <td className="num cell-strong">{money(r.invoice.total, r.invoice.currency)}</td>
-                <td>{f ? REASON_LABEL[f.code] : "—"}</td>
-                <td>{f ? <Severity action={f.action} /> : "—"}</td>
-                <td style={{ maxWidth: 340 }} className="small">
-                  {r.decision.nextAction}
-                </td>
-                <td>
-                  <StatusBadge status={r.status} />
-                </td>
-                {showAge && <td className="muted tabnum">{timeAgo(r.createdAt)}</td>}
-                <td>
-                  <button className="btn btn-sm" onClick={(e) => (e.stopPropagation(), go(r.id, from))}>
-                    Review
-                  </button>
-                </td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
-    </div>
-  );
+    .map((r) => {
+      const f = topFinding(r);
+      const sev = SEVERITY[f?.action ?? "info"];
+      const action = ACTION_GROUPS.find((g) => g.key === requiredAction(r, openCodes(r)))!.label;
+      return { ...r, action, why: `${sev.label} severity · ${money(r.invoice.total, r.invoice.currency)} at stake · waiting ${timeAgo(r.createdAt)}`, _rank: sev.rank };
+    })
+    .sort((a, b) => b._rank - a._rank || (b.invoice.total ?? 0) - (a.invoice.total ?? 0) || a.createdAt - b.createdAt);
 }
 
 type Filter = "all" | CaseStatus;
@@ -95,22 +42,22 @@ export function RunsTable({ runs, loaded, from, limit }: { runs: RunRecord[]; lo
     ["rejected", "Rejected"],
   ];
   return (
-    <>
+    <div>
       <div className="toolbar">
         <label className="search">
           {Icon.search}
-          <input className="input" placeholder="Search vendor, invoice, PO…" value={q} onChange={(e) => setQ(e.target.value)} />
+          <input className="input" placeholder="Search vendor, invoice, PO" aria-label="Search invoices" value={q} onChange={(e) => setQ(e.target.value)} />
         </label>
         <div className="seg" role="group" aria-label="Filter by status">
           {FILTERS.map(([k, l]) => (
-            <button key={k} className={filter === k ? "seg-on" : ""} onClick={() => setFilter(k)}>
+            <button key={k} className={filter === k ? "on" : ""} aria-pressed={filter === k} onClick={() => setFilter(k)}>
               {l}
             </button>
           ))}
         </div>
         {limit && shown.length > limit && (
           <a className="small" href="/history" style={{ marginLeft: "auto" }}>
-            View all {shown.length} →
+            All {shown.length} invoices →
           </a>
         )}
       </div>
@@ -120,7 +67,7 @@ export function RunsTable({ runs, loaded, from, limit }: { runs: RunRecord[]; lo
         <Empty title={runs.length ? "No invoices match" : "No invoices processed yet"}>{runs.length ? "Try a different search or filter." : <a href="/process">Process your first invoice →</a>}</Empty>
       ) : (
         <div className="table-wrap">
-          <table className="table table-click">
+          <table className="dense dense-click">
             <thead>
               <tr>
                 <th>Processed</th>
@@ -128,38 +75,36 @@ export function RunsTable({ runs, loaded, from, limit }: { runs: RunRecord[]; lo
                 <th>Invoice</th>
                 <th className="num">Amount</th>
                 <th>PO</th>
-                <th>Decision</th>
-                <th>Primary reason</th>
+                <th>Status</th>
+                <th>Reason</th>
                 <th className="num">Time</th>
               </tr>
             </thead>
             <tbody>
-              {list.map((r) => {
-                return (
-                  <tr key={r.id} onClick={() => go(r.id, from)}>
-                    <td className="muted tabnum">{fmtDate(r.createdAt)}</td>
-                    <td className="cell-strong">{r.vendorMatched ?? r.invoice.vendor}</td>
-                    <td className="mono">
-                      {r.invoice.invoiceNumber ?? "—"}
-                      {r.repeatSubmission && <div className="cell-sub">repeat submission</div>}
-                    </td>
-                    <td className="num">{money(r.invoice.total, r.invoice.currency)}</td>
-                    <td className="mono">
-                      {r.poMatch.po?.id ?? "—"}
-                      {r.poMatch.method === "inferred" && <div className="cell-sub">suggested</div>}
-                    </td>
-                    <td>
-                      <StatusBadge status={r.status} />
-                    </td>
-                    <td className="small">{primaryReason(r, (f) => REASON_LABEL[f.code])}</td>
-                    <td className="num muted">{(r.durationMs / 1000).toFixed(1)} s</td>
-                  </tr>
-                );
-              })}
+              {list.map((r) => (
+                <tr key={r.id} tabIndex={0} onClick={() => go(r.id, from)} onKeyDown={(e) => e.key === "Enter" && go(r.id, from)}>
+                  <td className="muted tabnum">{fmtDate(r.createdAt)}</td>
+                  <td className="strong">{r.vendorMatched ?? r.invoice.vendor}</td>
+                  <td className="mono">
+                    {r.invoice.invoiceNumber ?? "—"}
+                    {r.repeatSubmission && <span className="sub">repeat</span>}
+                  </td>
+                  <td className="num strong">{money(r.invoice.total, r.invoice.currency)}</td>
+                  <td className="mono">
+                    {r.poMatch.po?.id ?? "—"}
+                    {r.poMatch.method === "inferred" && <span className="sub">suggested</span>}
+                  </td>
+                  <td>
+                    <StatusBadge status={r.status} />
+                  </td>
+                  <td className="muted">{primaryReason(r, (f) => REASON_LABEL[f.code])}</td>
+                  <td className="num muted">{(r.durationMs / 1000).toFixed(1)} s</td>
+                </tr>
+              ))}
             </tbody>
           </table>
         </div>
       )}
-    </>
+    </div>
   );
 }

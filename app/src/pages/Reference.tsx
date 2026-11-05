@@ -1,31 +1,59 @@
+import { useState } from "react";
 import { PURCHASE_ORDERS } from "../data/purchaseOrders";
 import { ERP_LEDGER, VENDORS } from "../data/vendors";
-import { buildLedger, isOpen, maskAccount, money } from "../lib/engine";
-import { PageHead, Shell } from "../Shell";
-import { useRuns } from "../ui";
+import { buildLedger, isConfirmed, isOpen, maskAccount, money } from "../lib/engine";
+import { Tabs } from "../runView";
+import { Shell } from "../Shell";
+import { Icon, useRuns } from "../ui";
+
+type Tab = "po" | "vendors" | "payments";
 
 export default function Reference() {
   const { runs } = useRuns();
+  const [tab, setTab] = useState<Tab>("po");
+  const [q, setQ] = useState("");
   const ledger = buildLedger(ERP_LEDGER, runs);
-  const billed = (id: string) => ledger.filter((l) => l.poId === id).reduce((s, l) => s + l.total, 0);
+  const confirmed = (id: string) => ledger.filter((l) => l.poId === id && isConfirmed(l)).reduce((s, l) => s + l.total, 0);
+  const pending = (id: string) => ledger.filter((l) => l.poId === id && !isConfirmed(l)).reduce((s, l) => s + l.total, 0);
+  const needle = q.trim().toLowerCase();
+  const hit = (...xs: (string | null | undefined)[]) => !needle || xs.some((x) => x?.toLowerCase().includes(needle));
+
   return (
     <Shell page="reference" openCount={runs.filter((r) => isOpen(r.status)).length}>
-      <PageHead title="Reference data" sub="The records every invoice is checked against. Demo data standing in for the ERP." />
-      <div className="ref-grid">
-        <section className="card">
-          <div className="card-head">
-            <div className="card-title">Purchase orders</div>
-            <span className="small muted">Billed = paid ERP invoices + invoices processed here that were not rejected</span>
-          </div>
-          <div className="table-wrap">
-            <table className="table">
+      <header className="page-head">
+        <div>
+          <div className="eyebrow">Reference data · demo data standing in for the ERP</div>
+          <h1 className="display-sm">What every invoice is checked against</h1>
+        </div>
+      </header>
+      <section className="surface">
+        <Tabs<Tab>
+          value={tab}
+          onChange={setTab}
+          tabs={[
+            { id: "po", label: "Purchase orders", count: PURCHASE_ORDERS.length },
+            { id: "vendors", label: "Vendor master", count: VENDORS.length },
+            { id: "payments", label: "Payment history", count: ERP_LEDGER.length },
+          ]}
+        />
+        <div className="toolbar">
+          <label className="search">
+            {Icon.search}
+            <input className="input" placeholder="Search" aria-label="Search reference data" value={q} onChange={(e) => setQ(e.target.value)} />
+          </label>
+          {tab === "po" && <span className="small muted">Confirmed = paid in ERP or approved here. Pending = in review or on hold here; not committed spend.</span>}
+        </div>
+        <div className="table-wrap">
+          {tab === "po" && (
+            <table className="dense">
               <thead>
                 <tr>
                   <th>PO</th>
                   <th>Vendor</th>
-                  <th>Lines</th>
+                  <th>Ordered</th>
                   <th className="num">PO value</th>
-                  <th className="num">Billed</th>
+                  <th className="num">Confirmed billed</th>
+                  <th className="num">Pending</th>
                   <th className="num">Remaining</th>
                   <th>Expires</th>
                   <th>Owner</th>
@@ -33,75 +61,61 @@ export default function Reference() {
                 </tr>
               </thead>
               <tbody>
-                {PURCHASE_ORDERS.map((p) => {
-                  const b = billed(p.id);
+                {PURCHASE_ORDERS.filter((p) => hit(p.id, p.vendor, p.approvedBy, ...p.lineItems.map((l) => l.description))).map((p) => {
+                  const cb = confirmed(p.id);
+                  const pb = pending(p.id);
                   return (
                     <tr key={p.id}>
-                      <td className="mono cell-strong">{p.id}</td>
+                      <td className="mono strong">{p.id}</td>
                       <td>{p.vendor}</td>
-                      <td className="small">{p.lineItems.map((l) => `${l.quantity} × ${l.description}`).join("; ")}</td>
+                      <td className="muted">{p.lineItems.map((l) => `${l.quantity} × ${l.description}`).join("; ")}</td>
                       <td className="num">{money(p.total, p.currency)}</td>
-                      <td className="num">{money(b, p.currency)}</td>
-                      <td className="num" style={p.total - b < 0 ? { color: "var(--bad-ink)" } : undefined}>
-                        {money(p.total - b, p.currency)}
-                      </td>
+                      <td className="num">{money(cb, p.currency)}</td>
+                      <td className="num muted">{pb ? money(pb, p.currency) : "—"}</td>
+                      <td className={`num ${p.total - cb < 0 ? "t-bad" : ""}`}>{money(p.total - cb, p.currency)}</td>
                       <td className="tabnum">{p.expirationDate}</td>
                       <td>{p.approvedBy}</td>
                       <td>
-                        <span className="chip">{p.status}</span>
+                        <span className={`tag ${p.status === "open" ? "tag-ok" : "tag-warn"}`}>{p.status}</span>
                       </td>
                     </tr>
                   );
                 })}
               </tbody>
             </table>
-          </div>
-        </section>
-
-        <section className="card">
-          <div className="card-head">
-            <div className="card-title">Vendor master</div>
-            <span className="small muted">Approved payees, the bank account we pay to, and the trusted contact for call-back verification</span>
-          </div>
-          <div className="table-wrap">
-            <table className="table">
+          )}
+          {tab === "vendors" && (
+            <table className="dense">
               <thead>
                 <tr>
                   <th>ID</th>
                   <th>Vendor</th>
                   <th>Also known as</th>
-                  <th>Bank account</th>
+                  <th>Bank account we pay to</th>
                   <th>Trusted contact</th>
                   <th>Status</th>
                 </tr>
               </thead>
               <tbody>
-                {VENDORS.map((v) => (
+                {VENDORS.filter((v) => hit(v.id, v.name, ...v.aliases)).map((v) => (
                   <tr key={v.id}>
                     <td className="mono">{v.id}</td>
-                    <td className="cell-strong">{v.name}</td>
-                    <td className="small muted">{v.aliases.join(", ")}</td>
-                    <td>
-                      {maskAccount(v.bankAccount)} <span className="muted small">· {v.bankName}</span>
+                    <td className="strong">{v.name}</td>
+                    <td className="muted">{v.aliases.join(", ")}</td>
+                    <td className="tabnum">
+                      {maskAccount(v.bankAccount)} <span className="muted">· {v.bankName}</span>
                     </td>
                     <td className="tabnum">{v.phone}</td>
                     <td>
-                      <span className="chip">{v.status}</span>
+                      <span className="tag tag-ok">{v.status}</span>
                     </td>
                   </tr>
                 ))}
               </tbody>
             </table>
-          </div>
-        </section>
-
-        <section className="card">
-          <div className="card-head">
-            <div className="card-title">ERP payment history</div>
-            <span className="env-tag">Demo data</span>
-          </div>
-          <div className="table-wrap">
-            <table className="table">
+          )}
+          {tab === "payments" && (
+            <table className="dense">
               <thead>
                 <tr>
                   <th>Invoice</th>
@@ -109,27 +123,27 @@ export default function Reference() {
                   <th>PO</th>
                   <th>Date</th>
                   <th className="num">Amount</th>
-                  <th>Status</th>
+                  <th>Record</th>
                 </tr>
               </thead>
               <tbody>
-                {ERP_LEDGER.map((l) => (
+                {ERP_LEDGER.filter((l) => hit(l.invoiceNumber, l.vendor, l.poId)).map((l) => (
                   <tr key={l.invoiceNumber}>
-                    <td className="mono cell-strong">{l.invoiceNumber}</td>
+                    <td className="mono strong">{l.invoiceNumber}</td>
                     <td>{l.vendor}</td>
                     <td className="mono">{l.poId ?? "—"}</td>
                     <td className="tabnum">{l.issueDate}</td>
                     <td className="num">{money(l.total)}</td>
                     <td>
-                      <span className="chip">Paid (payment record)</span>
+                      <span className="tag tag-ok">Paid · payment record</span>
                     </td>
                   </tr>
                 ))}
               </tbody>
             </table>
-          </div>
-        </section>
-      </div>
+          )}
+        </div>
+      </section>
     </Shell>
   );
 }

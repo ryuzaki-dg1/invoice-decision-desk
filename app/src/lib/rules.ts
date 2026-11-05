@@ -1,25 +1,8 @@
-// AP policy knobs. Every threshold the decision engine uses lives here so the
-// AP lead can tune it from the UI, and the run trail can say which limit fired.
+// Browser persistence for the policy thresholds (see policy.ts for the values).
 
-export interface Rules {
-  amountTolerancePct: number; // fraction: invoice total vs remaining PO value
-  priceTolerancePct: number; // fraction: unit price vs PO unit price
-  quantityTolerance: number; // whole units over the PO quantity
-  arithmeticToleranceAbs: number; // currency units: line sums vs printed totals
-  duplicateWindowDays: number; // same vendor + same amount within N days
-  autoApproveLimit: number; // anything above this total always gets a human
-  reviewHandwritten: boolean; // never auto-approve handwritten invoices
-}
+import { DEFAULT_RULES, type Rules } from "./policy.ts";
 
-export const DEFAULT_RULES: Rules = {
-  amountTolerancePct: 0.02,
-  priceTolerancePct: 0.02,
-  quantityTolerance: 0,
-  arithmeticToleranceAbs: 1.0,
-  duplicateWindowDays: 45,
-  autoApproveLimit: 25000,
-  reviewHandwritten: true,
-};
+export { DEFAULT_RULES, type Rules };
 
 const STORAGE_KEY = "ap_rules_v2";
 

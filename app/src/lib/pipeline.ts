@@ -8,7 +8,7 @@ import type { Decision, Explanation, Finding, Invoice, LedgerInvoice, PurchaseOr
 import type { PreparedDocument } from "./document.ts";
 import { checkDuplicates, checkVendor, decide, describeLedgerStatus, initialStatus, matchPurchaseOrder, money, templateExplanation, validateInvoice, type PriorSubmission } from "./engine.ts";
 import { chat, chatStream, extractJson, type MessageContent } from "./llm.ts";
-import type { Rules } from "./rules.ts";
+import type { Rules } from "./policy.ts";
 
 export const STAGES: { id: StageId; label: string; what: string }[] = [
   { id: "ingest", label: "Ingest document", what: "Render pages and detect digital text vs scan" },
@@ -219,6 +219,7 @@ export async function runPipeline(doc: PreparedDocument, ctx: PipelineContext, c
     resolvedCodes: [],
     hasPreview: false,
     repeatSubmission: dup.repeat,
+    rules: { ...ctx.rules },
     duplicateOf: dup.duplicateOf,
     audit: [{ at: Date.now(), actor: "System", kind: "system", action: `Automated decision: ${decision.headline}`, toStatus: status, note: decision.decidingCodes.join(", ") || "All checks passed" }],
   };
@@ -234,7 +235,7 @@ async function explain(
 ): Promise<Explanation> {
   const wantsEmail = decision.resolution === "FLAG_FOR_REVIEW" || decision.resolution === "REJECT";
   const system = `You write for an accounts-payable executive. The decision has ALREADY been made by deterministic rules; never change, soften or question it.
-Accuracy rules: only state facts present in the FINDINGS. "Approved" means eligible for payment, NOT paid; only say "paid" if a finding says there is a payment record. Never claim a verification happened. Never invent amounts.
+Accuracy rules: only state facts present in the FINDINGS. Quote amounts and percentages exactly as written there; never calculate or round your own. Never describe the approved account's digits as the invoice's account. "Approved" means eligible for payment, NOT paid; only say "paid" if a finding says there is a payment record. Never claim a verification happened. Never invent amounts.
 Write exactly two sections:
 SUMMARY:
 2-4 short sentences: what the invoice is, the decision, and the specific reason(s) with the actual numbers. Plain English, no rule codes.

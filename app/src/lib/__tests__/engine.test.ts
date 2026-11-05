@@ -6,9 +6,10 @@ import assert from "node:assert/strict";
 import { PURCHASE_ORDERS } from "../../data/purchaseOrders.ts";
 import { ERP_LEDGER, VENDORS } from "../../data/vendors.ts";
 import type { Invoice, LedgerInvoice, RunRecord } from "../../types.ts";
-import { buildLedger, checkDuplicates, checkVendor, decide, initialStatus, matchPurchaseOrder, normalizeInvoiceNumber, validateInvoice, type PriorSubmission } from "../engine.ts";
+import { buildLedger, checkDuplicates, checkVendor, decide, fmtPct, initialStatus, matchPurchaseOrder, normalizeInvoiceNumber, suggestPos, validateInvoice, type PriorSubmission } from "../engine.ts";
 import { applyReviewAction, availableActions } from "../review.ts";
-import { DEFAULT_RULES } from "../rules.ts";
+import { applyCorrections } from "../revalidate.ts";
+import { DEFAULT_RULES } from "../policy.ts";
 
 const TODAY = "2026-11-05";
 
@@ -208,6 +209,30 @@ test("same amount but different invoice number is only a possible duplicate", ()
   assert.ok(other.blocking.includes("POSSIBLE_DUPLICATE"));
 });
 
+test("percentages use one format everywhere ($486 / $9,570 = +5.08%)", () => {
+  assert.equal(fmtPct(486 / 9570), "+5.08%");
+  const r = run(
+    inv({ vendor: "Bluepeak Components Inc.", invoiceNumber: "INV-4471", poReference: "PO-2026-0184", lineItems: [{ description: 'PCB assembly rev 3.2 - "Orion"', quantity: 100, unitPrice: 92, total: 9200 }], subtotal: 9200, tax: 736, shipping: 120, total: 10056 }),
+  );
+  const f = r.findings.find((x) => x.code === "PO_AMOUNT_EXCEEDED")!;
+  assert.match(f.detail, /\+5\.08%/);
+  assert.ok(f.evidence!.some((e) => e.value.includes("+5.08%")));
+  assert.doesNotMatch(JSON.stringify(r.findings), /5\.1%|0\.508/);
+});
+
+test("pending (in review / on hold) invoices are not counted as billed, but conflicts are flagged", () => {
+  const pendingLedger: LedgerInvoice[] = [
+    ...ERP_LEDGER,
+    { vendorId: "V-005", vendor: "Sunridge Chemicals Ltd.", invoiceNumber: "SC-3380", poId: "PO-2026-0211", total: 2548.8, issueDate: "2026-11-01", lineItems: [], status: "in_review", source: "run", runId: "r-x" },
+  ];
+  const i = inv({ vendor: "Sunridge Chemicals", invoiceNumber: "SC-3384", poReference: "PO-2026-0211", lineItems: [{ description: "Industrial solvent XR-4 (drum, 55gal)", quantity: 8, unitPrice: 295, total: 2360 }], subtotal: 2360, tax: 188.8, total: 2548.8 });
+  const r = run(i, pendingLedger);
+  assert.equal(r.poMatch.billing?.previouslyBilled, 3823.2, "pending SC-3380 is not committed spend");
+  assert.equal(r.poMatch.billing?.pendingOnPo, 2548.8);
+  assert.ok(r.blocking.includes("PENDING_PO_CONFLICT"));
+  assert.equal(r.decision.resolution, "FLAG_FOR_REVIEW");
+});
+
 test("04 handwritten, no PO: PO is a suggestion and routes to review", () => {
   const r = run(
     inv({
@@ -289,8 +314,85 @@ test("inferred PO must be confirmed before approval", () => {
   const c = applyReviewAction(r, { action: "confirm_po", reviewer: "Priya", justification: "Plant manager confirmed PO-2026-0225" });
   assert.ok(c.ok && c.run.status === "needs_review");
   if (!c.ok) return;
-  const a = applyReviewAction(c.run, { action: "approve", reviewer: "Priya", justification: "Checked handwritten figures against original" });
+  assert.equal(applyReviewAction(c.run, { action: "approve", reviewer: "Priya", justification: "fine" }).ok, false, "handwritten figures still unconfirmed");
+  const f = applyReviewAction(c.run, { action: "confirm_fields", reviewer: "Priya", justification: "Checked every figure against the photo" });
+  assert.ok(f.ok);
+  if (!f.ok) return;
+  const a = applyReviewAction(f.run, { action: "approve", reviewer: "Priya", justification: "All confirmations complete" });
   assert.ok(a.ok && a.run.status === "approved");
+});
+
+// ---------- Correction + re-validation loop ----------
+
+const RAO_MISREAD = inv({
+  vendor: "Rao Electrical Contractors",
+  invoiceNumber: "118",
+  lineItems: [
+    { description: "Panel rewiring - Plant 2 (labour)", quantity: 1, unitPrice: 1350, total: 1350 }, // overwritten 8 read as 3
+    { description: "Cable, breakers & fittings (materials)", quantity: 1, unitPrice: 640, total: 640 },
+  ],
+  subtotal: 2490,
+  tax: 199.2,
+  total: 2689.2,
+  documentType: "handwritten",
+  lowConfidenceFields: ["lineItems[0].unitPrice"],
+});
+
+test("correction loop: a misread handwritten figure blocks approval until corrected, then every check re-runs", () => {
+  const r0 = asRun(RAO_MISREAD, run(RAO_MISREAD), "run-rao");
+  assert.ok(r0.findings.some((f) => f.code === "ARITHMETIC_MISMATCH"));
+  assert.equal(availableActions(r0).find((a) => a.id === "approve")?.allowed, false);
+
+  const fixed = applyCorrections(r0, { reviewer: "Priya", reason: "Labour amount is 1850 on the photo (8 written over 3)", invoice: { lineItems: [{ unitPrice: 1850, total: 1850 }] } }, [r0]);
+  assert.ok(fixed.ok);
+  if (!fixed.ok) return;
+  const r1 = fixed.run;
+  assert.deepEqual(
+    fixed.changes.map((c) => `${c.field}:${c.from}->${c.to}`),
+    ["lineItems[0].unitPrice:1350->1850", "lineItems[0].total:1350->1850"],
+  );
+  assert.ok(!r1.findings.some((f) => f.code === "ARITHMETIC_MISMATCH"), "arithmetic re-checked and now reconciles");
+  assert.ok(r1.findings.some((f) => f.code === "PO_MATCH_UNCONFIRMED"), "PO still only a suggestion");
+  assert.ok(r1.findings.some((f) => f.code === "HANDWRITTEN_DOCUMENT"), "handwritten policy still applies");
+  assert.equal(r1.status, "needs_review");
+  assert.equal(r1.originalInvoice?.lineItems[0].unitPrice, 1350, "original extraction preserved");
+  assert.equal(r1.corrections?.[0].reviewer, "Priya");
+  assert.match(r1.audit.at(-1)!.action, /lineItems\[0\]\.unitPrice 1350 → 1850/);
+
+  let r = r1;
+  for (const action of ["confirm_fields", "confirm_po", "approve"] as const) {
+    const step = applyReviewAction(r, { action, reviewer: "Priya", justification: "Checked against photo and PO owner" });
+    assert.ok(step.ok, action);
+    if (step.ok) r = step.run;
+  }
+  assert.equal(r.status, "approved");
+});
+
+test("correction loop: a correction that creates a duplicate is rejected by the re-run checks", () => {
+  const i = inv({ vendor: "Sunridge Chemicals", invoiceNumber: "SC-339O", poReference: "PO-2026-0211", lineItems: [{ description: "Industrial solvent XR-4 (drum, 55gal)", quantity: 8, unitPrice: 295, total: 2360 }], subtotal: 2360, tax: 188.8, total: 2548.8, documentType: "scanned", lowConfidenceFields: ["invoiceNumber"] });
+  const r0 = asRun(i, run(i), "run-s");
+  const res = applyCorrections(r0, { reviewer: "Priya", reason: "Number on the scan is SC-3371", invoice: { invoiceNumber: "SC-3371" } }, [r0]);
+  assert.ok(res.ok);
+  if (res.ok) {
+    assert.equal(res.run.status, "rejected");
+    assert.equal(res.run.duplicateOf?.invoiceNumber, "SC-3371");
+  }
+});
+
+test("correction loop: vendor and bank account cannot be edited; reason and name are required", () => {
+  const r0 = asRun(BANK_CHANGE, run(BANK_CHANGE), "run-b2");
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const sneaky = applyCorrections(r0, { reviewer: "Priya", reason: "use master account", invoice: { bankAccount: "441022874821", vendor: "Acme" } as any }, [r0]);
+  assert.equal(sneaky.ok, false);
+  assert.equal(applyCorrections(r0, { reviewer: "", reason: "valid reason", invoice: { tax: 1 } }, [r0]).ok, false);
+  assert.equal(applyCorrections(r0, { reviewer: "Priya", reason: "", invoice: { tax: 1 } }, [r0]).ok, false);
+});
+
+test("PO suggestions list candidates with reasons and never confirm", () => {
+  const v = checkVendor(RAO_MISREAD, VENDORS).vendor;
+  const s = suggestPos({ ...RAO_MISREAD, lineItems: [{ ...RAO_MISREAD.lineItems[0], unitPrice: 1850, total: 1850 }, RAO_MISREAD.lineItems[1]] }, v, PURCHASE_ORDERS, ERP_LEDGER, DEFAULT_RULES);
+  assert.equal(s[0].poId, "PO-2026-0225");
+  assert.ok(s[0].reasons.some((x) => /equals/.test(x)));
 });
 
 test("unknown-vendor hold cannot be approved by a reviewer", () => {

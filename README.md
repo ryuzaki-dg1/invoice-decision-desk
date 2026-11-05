@@ -24,7 +24,8 @@ An exception-first accounts-payable workspace. It takes a vendor invoice (digita
 Key rules:
 
 - **Arithmetic:** expected total = subtotal + tax + freight + other charges − discount, compared within a $1 rounding tolerance. The 2% PO tolerance never excuses an invoice that doesn't add up internally.
-- **PO value:** cumulative billing (previous invoices on the PO + this one) is compared against PO value × (1 + 2%). Split invoicing passes while the running total fits.
+- **PO value:** cumulative *confirmed* billing (paid in ERP or approved here) plus this invoice is compared against PO value × (1 + 2%). Split invoicing passes while the running total fits. Invoices still in review or on hold are not counted as spend; if they would push the PO over, `PENDING_PO_CONFLICT` sends this one to review.
+- **One percentage format** everywhere (2 decimals): $486 / $9,570 → +5.08%. The AI explanation must quote figures from the findings, not compute its own.
 - **Inferred PO:** shown as a *suggested* match (`PO_MATCH_UNCONFIRMED`) that a reviewer must confirm.
 - **Duplicates:** conservative invoice-number normalisation (case, spaces, punctuation, a leading "INV"/"Invoice No" label, leading zeros), scoped to the same vendor. Same amount with a different number is only a *possible* duplicate. A byte-identical re-upload is recorded as a repeat submission and never adds a payable.
 - **Approved ≠ paid:** "paid" is only said when the ERP history has a payment record (seeded demo data). Invoices approved here are "approved for payment, not yet paid".
@@ -40,13 +41,27 @@ Key rules:
 
 Every status change requires a reviewer name (lightweight demo identity) and a justification, and is logged with the from/to status and timestamp. Approved and rejected cases are final.
 
+## Handwritten / uncertain documents: correct and re-validate
+
+1. The model extracts what it can and reports fields it is unsure of (self-reported, not a calibrated score). Missing values stay missing.
+2. Handwritten invoices always go to review (configurable policy). The investigation screen shows the document beside an editable field form, marking each field as **missing**, **inconsistent**, **model unsure**, **not yet confirmed**, or **corrected**.
+3. A reviewer can correct the invoice number, date, PO reference, quantities, unit prices, line amounts, subtotal, tax, freight, discount and total. **Vendor name and bank account are deliberately not editable.**
+4. Saving sends the corrected invoice to the server, which **re-runs every deterministic check** (arithmetic, vendor, PO, cumulative billing, quantity, price, duplicates) with the run's own policy snapshot. The result can go up or down; a correction that creates a duplicate is rejected.
+5. The audit keeps the original extraction and records each change (field, from → to), reviewer, time and reason. Earlier PO and figure confirmations are cleared, because the data changed.
+6. Approval stays locked while the invoice doesn't reconcile or is missing fields, and until the reviewer confirms the figures and any suggested PO. A clean result after a correction still needs an explicit approval.
+7. With no PO printed, ranked **PO suggestions** show their reasons (same vendor, amount fit, matching lines). Applying one is a recorded correction, never a silent match.
+
+Demo file `04-rao-handwritten-no-po.jpg` has a genuinely ambiguous labour amount: an 8 written over a 3. In the latest live test Gemini read it correctly as 1850 and did not flag it; the case still went to review (handwritten + suggested PO). Nothing about the model output is hardcoded.
+
 ## Screens
 
-- **Overview:** KPIs (processed, straight-through rate, awaiting review, value requiring intervention, average time), *Needs your attention* ordered by severity then age, decision breakdown, top exception reasons, searchable activity.
-- **Process Invoice:** intake, an 8-stage live timeline (business-rule blocks shown separately from system errors), then the decision workspace.
-- **Review Queue:** open exceptions only; rejected invoices are closed.
-- **Invoice detail:** decision header (what / why / next / who decided), control strip, original document beside the extracted fields, evidence (invoice vs PO, vendor and bank vs master, duplicate reference), resolution panel, findings, audit trail, timeline, vendor email.
-- **Invoice History**, **Reference Data** (POs with billed/remaining, vendor master, ERP payment history) and **Policy Rules** (editable thresholds + precedence).
+Each page answers one question:
+
+- **Overview:** *What needs attention today?* A priority queue ordered by a transparent rule (severity, then amount at stake, then time waiting, with the reason shown), compact metrics, decision mix, frequent exceptions, recent activity.
+- **Process Invoice:** *Can this invoice be processed safely?* Three states: intake, then live processing (document + 8-stage timeline; business-rule blocks are distinct from system errors), then the investigation workspace.
+- **Review Queue:** *What should I do next?* Master-detail, grouped by the action needed (Verify bank details, Onboard vendor, Correct or confirm fields, Confirm PO, Resolve PO discrepancy…), with the selected case resolvable in place.
+- **Invoice detail:** *Why was this decided?* Document on the left (zoom, open original); decision, required action, evidence comparisons, field review/correction, resolution on the right. **Decision view** (default) shows only what's needed to act; **Detailed view** adds every rule finding, all evidence, vendor email, processing log and audit trail. The decision is the same in both.
+- **Invoice History** · **Reference Data** (tabs + search; confirmed billing (paid or approved) shown separately from pending invoices) · **Policy Rules** (grouped thresholds, fixed security controls, decision precedence, and an **impact preview** that re-runs the rules on stored invoices to show which decisions a threshold change would alter).
 
 Metric definitions:
 - **Straight-through rate:** auto-approved ÷ processed, excluding repeat submissions.
@@ -77,7 +92,7 @@ npm run dev            # http://localhost:5173
 
 ## Testing
 
-- `npm test` runs 17 tests on the decision engine and review rules: every scenario plus arithmetic, discounts, approved-vs-paid wording, repeat uploads, possible duplicates and reviewer controls. No API calls are made.
+- `npm test` runs 23 tests on the decision engine, review rules and correction loop: every scenario plus arithmetic, discounts, approved-vs-paid wording, repeat uploads, possible duplicates and reviewer controls. No API calls are made.
 - `node scripts/e2e.mjs` drives the real UI in Edge through all six invoices with the live model, then a repeat upload and the bank-verification review flow, and saves screenshots. It clears run history first. `--ui-only` reuses stored runs to save model quota.
 
 ## Deploy

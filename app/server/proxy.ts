@@ -105,10 +105,12 @@ async function callUpstream(body: unknown, stream: boolean): Promise<Response> {
   }
   const doFetch = buildFetch();
   // Primary model gets one quick retry, then each fallback gets one attempt.
-  const attempts = [p.model, p.model, ...p.fallbacks];
+  // If every model is overloaded, wait and go round once more before failing.
+  const chain = [p.model, p.model, ...p.fallbacks];
+  const attempts = [...chain, ...chain];
   let last: Response | null = null;
   for (let i = 0; i < attempts.length; i++) {
-    if (i > 0) await sleep(i === 1 ? 800 : 300);
+    if (i > 0) await sleep(i === chain.length ? 4000 : i === 1 ? 800 : 300);
     try {
       const res = await doFetch(p.url, { method: "POST", headers, body: JSON.stringify(upstreamBody(p, attempts[i], body, stream)) });
       if (res.ok || !RETRYABLE.has(res.status)) {

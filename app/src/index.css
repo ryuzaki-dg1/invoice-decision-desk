@@ -1,49 +1,50 @@
 :root {
-  --bg: #f6f8fb;
-  --surface: #ffffff;
-  --surface-2: #f8fafc;
-  --surface-3: #f1f4f9;
-  --border: #e4e9f1;
-  --border-strong: #d3dae6;
-  --ink: #17233b;
-  --ink-2: #3b4760;
-  --muted: #64748b;
-  --faint: #94a3b8;
-  --accent: #355cde;
-  --accent-hover: #2b4ec4;
-  --accent-soft: #eef2fe;
+  /* Warm paper + ink + forest teal */
+  --bg: #f4f1ea;
+  --paper: #fbfaf7;
+  --paper-2: #f6f3ec;
+  --paper-3: #eeeae0;
+  --line: #e4ded1;
+  --line-2: #d4ccbb;
+  --ink: #15202b;
+  --ink-2: #3d4652;
+  --muted: #6e6a61;
+  --faint: #a19b8e;
+  --primary: #0f4c45;
+  --primary-2: #0b3a35;
+  --primary-soft: #e2ece8;
+  --side: #121b1f;
+  --side-2: #1b272c;
+  --side-ink: #c5cfcb;
 
-  /* Status (validated as a set for charts; always paired with icon + label) */
-  --ok: #14a06f;
-  --ok-ink: #067a52;
-  --ok-bg: #e8f6f0;
-  --warn: #e9a23b;
-  --warn-ink: #8a5400;
-  --warn-bg: #fdf4e3;
-  --hold: #d9622b;
-  --hold-ink: #a8431a;
-  --hold-bg: #fdefe7;
-  --bad: #8e1d2c;
-  --bad-ink: #8e1d2c;
-  --bad-bg: #fbecee;
-  --info-ink: #3b4a8c;
-  --info-bg: #eef1fd;
+  /* Status: validated as a set (approved, review, hold, rejected); always with a label */
+  --ok: #2e7d50;
+  --ok-ink: #22603d;
+  --ok-bg: #e5efe7;
+  --warn: #d6a22a;
+  --warn-ink: #7a5600;
+  --warn-bg: #f8eed6;
+  --hold: #c4501f;
+  --hold-ink: #9a3b13;
+  --hold-bg: #f7e4da;
+  --bad: #a0215c;
+  --bad-ink: #8a1a4e;
+  --bad-bg: #f5e3ea;
+  --info-ink: #3c4a7a;
+  --info-bg: #e8ebf3;
 
-  --radius: 10px;
-  --radius-sm: 7px;
-  --shadow: 0 1px 2px rgba(16, 24, 40, 0.04), 0 1px 3px rgba(16, 24, 40, 0.03);
-  --shadow-lg: 0 12px 32px rgba(16, 24, 40, 0.12);
-  --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --r: 8px;
+  --r-sm: 6px;
+  --head: "Manrope", "Inter", system-ui, sans-serif;
   --sans: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 
   color-scheme: light;
   color: var(--ink);
   background: var(--bg);
-  font: 14px/1.55 var(--sans);
-  font-feature-settings: "cv11", "ss01";
+  font: 14.5px/1.55 var(--sans);
   -webkit-font-smoothing: antialiased;
 }
-
 html,
 body,
 #root {
@@ -51,37 +52,41 @@ body,
   min-height: 100vh;
   background: var(--bg);
 }
-
 * {
   box-sizing: border-box;
 }
-
 h1,
 h2,
-h3,
-h4 {
+h3 {
   margin: 0;
+  font-family: var(--head);
   color: var(--ink);
-  letter-spacing: -0.01em;
+  letter-spacing: -0.015em;
 }
-
+p {
+  margin: 0;
+}
 button {
   font: inherit;
   cursor: pointer;
 }
-
 button:disabled {
   cursor: not-allowed;
 }
-
 a {
-  color: var(--accent);
+  color: var(--primary);
   text-decoration: none;
 }
-
+a:hover {
+  text-decoration: underline;
+}
 input,
 textarea,
 select {
   font: inherit;
   color: inherit;
+}
+:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
 }

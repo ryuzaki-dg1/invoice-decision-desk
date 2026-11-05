@@ -86,7 +86,7 @@ $rows = @(
   @($h, "Bill No. 118                         Date: Nov 3, 2026", 140),
   @($h, "To: Ironworks Manufacturing - Plant 2", 140),
   @($h, "", 0),
-  @($h, "Panel rewiring - Plant 2 (labour)      1    1850.00", 140),
+  @($h, "OVERWRITE", 140),
   @($h, "Cable, breakers & fittings (materials)  1     640.00", 140),
   @($h, "", 0),
   @($h, "                         Sub total      2490.00", 140),
@@ -99,8 +99,26 @@ $rows = @(
   @($h1, "               - S. Rao", 140)
 )
 $y = 96
+$fmt = [System.Drawing.StringFormat]::GenericTypographic
 foreach ($r in $rows) {
-  if ($r[1]) { $g.DrawString($r[1], $r[0], $pen, ($r[2] + $rand.Next(-6, 7)), ($y + $rand.Next(-4, 5))) }
+  if ($r[1] -eq "OVERWRITE") {
+    # Labour amount with a corrected digit: the writer first wrote "1350",
+    # then wrote an 8 over the 3. Genuinely ambiguous; the true amount is 1850
+    # (it is the only value that makes the subtotal add up).
+    $x = $r[2] + $rand.Next(-6, 7); $yy = $y + $rand.Next(-4, 5)
+    $prefix = "Panel rewiring - Plant 2 (labour)      1    1"
+    $g.DrawString($prefix, $h, $pen, $x, $yy, $fmt)
+    $dx = $x + $g.MeasureString($prefix, $h, (New-Object System.Drawing.PointF 0, 0), $fmt).Width
+    $bold = New-Object System.Drawing.Font $fontName, 22, ([System.Drawing.FontStyle]::Bold)
+    $g.DrawString("3", $bold, $pen, $dx, $yy, $fmt)
+    $g.DrawString("8", $h, $pen, ($dx + 4), ($yy + 1), $fmt)
+    # ink blot where the pen paused on the correction
+    $g.FillEllipse((New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(90, 29, 42, 107))), ($dx + 3), ($yy + 14), 9, 7)
+    $dw = [Math]::Max($g.MeasureString("8", $bold, (New-Object System.Drawing.PointF 0, 0), $fmt).Width, $g.MeasureString("3", $h, (New-Object System.Drawing.PointF 0, 0), $fmt).Width)
+    $g.DrawString("50.00", $h, $pen, ($dx + $dw + 1), $yy, $fmt)
+  } elseif ($r[1]) {
+    $g.DrawString($r[1], $r[0], $pen, ($r[2] + $rand.Next(-6, 7)), ($y + $rand.Next(-4, 5)))
+  }
   $y += 58 + ($(if ($r[0] -eq $h1) { 20 } else { 0 }))
 }
 $enc = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq "image/jpeg" }

@@ -96,6 +96,7 @@ export type ExceptionCode =
   | "CURRENCY_MISMATCH"
   | "PO_AMOUNT_EXCEEDED"
   | "CUMULATIVE_PO_EXCEEDED"
+  | "PENDING_PO_CONFLICT"
   | "QUANTITY_EXCEEDS_PO"
   | "PRICE_VARIANCE"
   | "LINE_NOT_ON_PO"
@@ -130,7 +131,9 @@ export interface BillingSummary {
   thisInvoice: number;
   billedAfter: number;
   remainingAfter: number;
-  priorInvoices: string[];
+  priorInvoices: string[]; // confirmed: paid or approved
+  pendingOnPo: number; // other invoices on this PO still in review / on hold
+  pendingInvoices: string[];
 }
 
 export interface LineCheck {
@@ -226,4 +229,35 @@ export interface RunRecord {
   repeatSubmission: boolean;
   duplicateOf?: DuplicateRef;
   audit: AuditEvent[];
+  // Policy thresholds in force when the run was processed; re-used when a
+  // reviewer's corrections are re-validated.
+  rules?: RulesSnapshot;
+  // First model extraction, kept once a reviewer corrects any field.
+  originalInvoice?: Invoice;
+  corrections?: Correction[];
+}
+
+export interface RulesSnapshot {
+  amountTolerancePct: number;
+  priceTolerancePct: number;
+  quantityTolerance: number;
+  arithmeticToleranceAbs: number;
+  duplicateWindowDays: number;
+  autoApproveLimit: number;
+  reviewHandwritten: boolean;
+}
+
+export interface FieldChange {
+  field: string; // e.g. "total", "lineItems[0].unitPrice"
+  from: string;
+  to: string;
+}
+
+export interface Correction {
+  at: number;
+  reviewer: string;
+  reason: string;
+  changes: FieldChange[];
+  decisionBefore: Resolution;
+  decisionAfter: Resolution;
 }

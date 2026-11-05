@@ -31,7 +31,7 @@ import type {
   StageId,
   Vendor,
 } from "../types.ts";
-import type { Rules } from "./rules.ts";
+import type { Rules } from "./policy.ts";
 
 // ---------- Normalisation helpers ----------
 
@@ -98,7 +98,14 @@ export function money(amount: number | null | undefined, currency = "USD"): stri
 }
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
-const pct = (n: number, digits = 2) => `${n >= 0 ? "+" : ""}${(n * 100).toFixed(digits)}%`;
+
+// The ONE percentage format used everywhere (engine text, evidence, UI):
+// fraction in, signed 2-decimal percent out. 486 / 9570 → "+5.08%".
+export function fmtPct(fraction: number, signed = true): string {
+  const v = (fraction * 100).toFixed(2);
+  return signed && fraction >= 0 ? `+${v}%` : `${v}%`;
+}
+const pct = (n: number) => fmtPct(n);
 const signedMoney = (n: number, c: string) => `${n >= 0 ? "+" : "−"}${money(Math.abs(n), c)}`;
 
 function finding(stage: StageId, code: ExceptionCode, action: CheckAction, title: string, detail: string, evidence?: Evidence[]): Finding {
@@ -291,13 +298,23 @@ function sameInvoice(a: InvoiceKey, b: InvoiceKey): boolean {
   return normalizeName(a.vendor) === normalizeName(b.vendor);
 }
 
-function priorOnPo(po: PurchaseOrder, inv: Invoice, vendorId: string | null, ledger: LedgerInvoice[]): LedgerInvoice[] {
+// Confirmed billing = paid (ERP payment record) or approved here. Invoices
+// still in review or on hold are NOT committed spend; they are tracked
+// separately as pending.
+export const isConfirmed = (l: LedgerInvoice) => l.status === "paid" || l.status === "approved";
+
+function onPo(po: PurchaseOrder, inv: Invoice, vendorId: string | null, ledger: LedgerInvoice[]): LedgerInvoice[] {
   // A duplicate of this invoice is not "previous billing" — counting it would double-count.
   return ledger.filter((l) => l.poId === po.id && !sameInvoice(l, { vendorId, vendor: inv.vendor, invoiceNumber: inv.invoiceNumber }));
 }
+function priorOnPo(po: PurchaseOrder, inv: Invoice, vendorId: string | null, ledger: LedgerInvoice[]): LedgerInvoice[] {
+  return onPo(po, inv, vendorId, ledger).filter(isConfirmed);
+}
 
 function billingFor(po: PurchaseOrder, inv: Invoice, vendorId: string | null, ledger: LedgerInvoice[], rules: Rules): BillingSummary {
-  const prior = priorOnPo(po, inv, vendorId, ledger);
+  const all = onPo(po, inv, vendorId, ledger);
+  const prior = all.filter(isConfirmed);
+  const pending = all.filter((l) => !isConfirmed(l));
   const previouslyBilled = round2(prior.reduce((s, l) => s + l.total, 0));
   const thisInvoice = inv.total ?? 0;
   const billedAfter = round2(previouslyBilled + thisInvoice);
@@ -309,6 +326,8 @@ function billingFor(po: PurchaseOrder, inv: Invoice, vendorId: string | null, le
     billedAfter,
     remainingAfter: round2(po.total - billedAfter),
     priorInvoices: prior.map((p) => p.invoiceNumber),
+    pendingOnPo: round2(pending.reduce((s, l) => s + l.total, 0)),
+    pendingInvoices: pending.map((p) => p.invoiceNumber),
   };
 }
 
@@ -319,6 +338,36 @@ function matchLine(desc: string, lines: LineItem[]): LineItem | null {
     if (s >= 0.5 && (!best || s > best.s)) best = { li, s };
   }
   return best?.li ?? null;
+}
+
+export interface PoSuggestion {
+  poId: string;
+  poTotal: number;
+  openValue: number;
+  amountFitPct: number; // 100 = invoice equals open value
+  linesMatched: number;
+  linesTotal: number;
+  reasons: string[];
+  withinValue: boolean;
+}
+
+// All open POs for the vendor, ranked, each with the reasons it was suggested.
+// Used to help a reviewer pick a PO; never confirms one by itself.
+export function suggestPos(inv: Invoice, vendor: Vendor | null, pos: PurchaseOrder[], ledger: LedgerInvoice[], rules: Rules): PoSuggestion[] {
+  if (!vendor) return [];
+  const out: PoSuggestion[] = [];
+  for (const po of pos.filter((p) => p.vendorId === vendor.id && p.status === "open")) {
+    const b = billingFor(po, inv, vendor.id, ledger, rules);
+    const open = round2(po.total - b.previouslyBilled);
+    const total = inv.total ?? 0;
+    const fit = open > 0 && total > 0 ? 1 - Math.min(1, Math.abs(open - total) / open) : 0;
+    const matched = inv.lineItems.filter((li) => matchLine(li.description, po.lineItems)).length;
+    const reasons = [`Same vendor (${vendor.name})`];
+    if (total > 0) reasons.push(Math.abs(open - total) < 0.01 ? `Amount equals the ${money(open, po.currency)} open on the PO` : `Invoice ${money(total, inv.currency)} vs ${money(open, po.currency)} open (${Math.round(fit * 100)}% fit)`);
+    reasons.push(`${matched} of ${inv.lineItems.length} line descriptions match`);
+    out.push({ poId: po.id, poTotal: po.total, openValue: open, amountFitPct: Math.round(fit * 100), linesMatched: matched, linesTotal: inv.lineItems.length, reasons, withinValue: total <= open * (1 + rules.amountTolerancePct) });
+  }
+  return out.sort((a, b) => b.amountFitPct * 0.6 + (b.linesMatched / Math.max(1, b.linesTotal)) * 40 - (a.amountFitPct * 0.6 + (a.linesMatched / Math.max(1, a.linesTotal)) * 40));
 }
 
 function inferPo(inv: Invoice, vendor: Vendor | null, pos: PurchaseOrder[], ledger: LedgerInvoice[], rules: Rules): { po: PurchaseOrder; note: string } | null {
@@ -430,7 +479,7 @@ export function matchPurchaseOrder(
   const ceiling = round2(po.total * (1 + rules.amountTolerancePct));
   const variance = round2(billing.billedAfter - po.total);
   const variancePct = po.total ? variance / po.total : 0;
-  const tolText = `${(rules.amountTolerancePct * 100).toFixed(2)}%`;
+  const tolText = fmtPct(rules.amountTolerancePct, false);
   const valueEvidence: Evidence[] = [
     { label: "PO value", value: money(po.total, po.currency) },
     ...(billing.previouslyBilled > 0 ? [{ label: `Previously billed (${billing.priorInvoices.join(", ")})`, value: money(billing.previouslyBilled, po.currency) }] : []),
@@ -450,7 +499,7 @@ export function matchPurchaseOrder(
           "CUMULATIVE_PO_EXCEEDED",
           "review",
           "Cumulative billing exceeds the PO",
-          `${po.id} is for ${money(po.total, po.currency)}. ${money(billing.previouslyBilled, po.currency)} was already billed on ${billing.priorInvoices.join(", ")}; this invoice adds ${money(billing.thisInvoice, c)}, so ${money(billing.billedAfter, po.currency)} would be billed in total, ${money(variance, po.currency)} (${pct(variancePct, 1)}) over the PO. Tolerance is ${tolText}.`,
+          `${po.id} is for ${money(po.total, po.currency)}. ${money(billing.previouslyBilled, po.currency)} was already billed on ${billing.priorInvoices.join(", ")}; this invoice adds ${money(billing.thisInvoice, c)}, so ${money(billing.billedAfter, po.currency)} would be billed in total, ${money(variance, po.currency)} (${pct(variancePct)}) over the PO. Tolerance is ${tolText}.`,
           valueEvidence,
         ),
       );
@@ -461,11 +510,22 @@ export function matchPurchaseOrder(
           "PO_AMOUNT_EXCEEDED",
           "review",
           "Invoice exceeds the PO value",
-          `Invoice ${money(billing.thisInvoice, c)} vs PO ${money(po.total, po.currency)}: ${signedMoney(variance, po.currency)} (${pct(variancePct, 1)}), above the ${tolText} tolerance.`,
+          `Invoice ${money(billing.thisInvoice, c)} vs PO ${money(po.total, po.currency)}: ${signedMoney(variance, po.currency)} (${pct(variancePct)}), above the ${tolText} tolerance.`,
           valueEvidence,
         ),
       );
     }
+  } else if (billing.pendingOnPo > 0 && billing.billedAfter + billing.pendingOnPo > ceiling) {
+    findings.push(
+      finding(
+        "po_match",
+        "PENDING_PO_CONFLICT",
+        "review",
+        "Competes with pending invoices on the PO",
+        `This invoice fits within ${po.id} on confirmed billing, but ${money(billing.pendingOnPo, po.currency)} more is pending review or on hold (${billing.pendingInvoices.join(", ")}). If both were approved the PO would be exceeded. Decide which one the PO covers.`,
+        [...valueEvidence, { label: `Pending, not committed (${billing.pendingInvoices.join(", ")})`, value: money(billing.pendingOnPo, po.currency), tone: "bad" }],
+      ),
+    );
   } else if (billing.previouslyBilled > 0 || billing.remainingAfter > po.total * rules.amountTolerancePct) {
     findings.push(
       finding("po_match", "PARTIAL_BILLING", "info", "Partial billing against PO", `After this invoice ${money(billing.billedAfter, po.currency)} of ${po.id} is billed; ${money(Math.max(0, billing.remainingAfter), po.currency)} remains open.`, valueEvidence),
@@ -519,7 +579,7 @@ export function matchPurchaseOrder(
     }
     if (priceOver) {
       findings.push(
-        finding("po_match", "PRICE_VARIANCE", "review", "Unit price above PO price", `"${poLine.description}": invoiced at ${money(li.unitPrice, c)} vs PO ${money(poLine.unitPrice, po.currency)} (${pct(drift, 1)}).`),
+        finding("po_match", "PRICE_VARIANCE", "review", "Unit price above PO price", `"${poLine.description}": invoiced at ${money(li.unitPrice, c)} vs PO ${money(poLine.unitPrice, po.currency)} (${pct(drift)}).`),
       );
     }
   }
@@ -629,6 +689,8 @@ function reviewAction(code: ExceptionCode, inv: Invoice, vendor: Vendor | null, 
       return po && b ? `Confirm the extra ${money(b.billedAfter - b.poTotal, po.currency)} with ${po.approvedBy} or request a corrected invoice.` : null;
     case "QUANTITY_EXCEEDS_PO":
       return "Confirm with receiving how many units were actually delivered.";
+    case "PENDING_PO_CONFLICT":
+      return po ? `Decide with ${po.approvedBy} which pending invoice ${po.id} covers before approving.` : null;
     case "PO_MATCH_UNCONFIRMED":
       return po ? `Confirm ${po.id} with its owner ${po.approvedBy}, then record the confirmation.` : null;
     case "HANDWRITTEN_DOCUMENT":

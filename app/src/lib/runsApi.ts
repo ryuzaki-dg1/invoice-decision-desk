@@ -3,6 +3,7 @@
 
 import type { RunRecord } from "../types.ts";
 import type { ReviewRequest } from "./review.ts";
+import type { CorrectionRequest } from "./revalidate.ts";
 
 export async function fetchRuns(): Promise<RunRecord[]> {
   const res = await fetch("/api/runs");
@@ -30,6 +31,13 @@ export async function submitReview(id: string, req: ReviewRequest): Promise<RunR
   const res = await fetch(`/api/runs/${encodeURIComponent(id)}/actions`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(req) });
   const body = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(body.error ?? `Action failed (${res.status})`);
+  return body as RunRecord;
+}
+
+export async function submitCorrection(id: string, req: CorrectionRequest): Promise<RunRecord> {
+  const res = await fetch(`/api/runs/${encodeURIComponent(id)}/corrections`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(req) });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error ?? `Correction failed (${res.status})`);
   return body as RunRecord;
 }
 

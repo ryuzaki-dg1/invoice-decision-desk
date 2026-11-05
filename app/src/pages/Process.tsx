@@ -1,49 +1,42 @@
+// Three states: intake → live processing → investigation workspace.
+
 import { useCallback, useRef, useState } from "react";
 import { PURCHASE_ORDERS } from "../data/purchaseOrders";
 import { SAMPLES, type Sample } from "../data/samples";
 import { ERP_LEDGER, VENDORS } from "../data/vendors";
+import { DocumentPane, Investigation } from "../investigation";
 import { prepareDocument, type PreparedDocument } from "../lib/document";
-import { buildLedger, initialStatus, isOpen } from "../lib/engine";
+import { buildLedger, isOpen, money } from "../lib/engine";
 import { checkHealth } from "../lib/llm";
 import { runPipeline } from "../lib/pipeline";
 import { loadRules } from "../lib/rules";
 import { fetchRuns, saveRun } from "../lib/runsApi";
-import { ControlStrip, DecisionHeader, DuplicateEvidence, ExtractedData, FindingsList, PoComparison, Tabs, Timeline, VendorComms, VendorEvidence } from "../runView";
-import { PageHead, Shell } from "../Shell";
-import type { Decision, Explanation, Finding, Invoice, PoMatch, RunRecord, StageState } from "../types";
-import { Icon, StatusBadge, resolutionToStatus, useRuns } from "../ui";
-
-type Tab = "findings" | "evidence" | "extracted" | "comms";
+import { Timeline } from "../runView";
+import { Shell } from "../Shell";
+import type { Invoice, RunRecord, StageState } from "../types";
+import { Icon, StatusBadge, resolutionToStatus, useRuns, useToast } from "../ui";
 
 export default function Process() {
-  const { runs, setRuns } = useRuns();
+  const { runs, setRuns, replace } = useRuns();
   const [doc, setDoc] = useState<PreparedDocument | null>(null);
   const [activeSample, setActiveSample] = useState<string | null>(null);
-  const [showSamples, setShowSamples] = useState(true);
   const [preparing, setPreparing] = useState(false);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [stages, setStages] = useState<StageState[]>([]);
   const [invoice, setInvoice] = useState<Invoice | null>(null);
-  const [findings, setFindings] = useState<Finding[]>([]);
-  const [decision, setDecision] = useState<Decision | null>(null);
   const [streaming, setStreaming] = useState("");
-  const [result, setResult] = useState<{ poMatch: PoMatch; explanation: Explanation } | null>(null);
   const [saved, setSaved] = useState<RunRecord | null>(null);
-  const [tab, setTab] = useState<Tab>("findings");
   const [dragOver, setDragOver] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
+  const [toast, notify] = useToast();
 
   const reset = () => {
     setStages([]);
     setInvoice(null);
-    setFindings([]);
-    setDecision(null);
     setStreaming("");
-    setResult(null);
     setSaved(null);
     setError(null);
-    setTab("findings");
   };
 
   const loadFile = async (file: File, sample: string | null) => {
@@ -52,7 +45,6 @@ export default function Process() {
     setActiveSample(sample);
     try {
       setDoc(await prepareDocument(file));
-      if (sample) setShowSamples(false);
     } catch (e) {
       setDoc(null);
       setError((e as Error).message);
@@ -88,12 +80,9 @@ export default function Process() {
         {
           onStage: (s) => setStages((prev) => [...prev.filter((p) => p.id !== s.id), s]),
           onInvoice: setInvoice,
-          onFindings: setFindings,
-          onDecision: setDecision,
           onExplainToken: (t) => setStreaming((p) => p + t),
         },
       );
-      setResult({ poMatch: out.poMatch, explanation: out.explanation });
       const rec = await saveRun(out, doc.pageImages[0]);
       setSaved(rec);
       setRuns((p) => [rec, ...p]);
@@ -104,18 +93,105 @@ export default function Process() {
     }
   }, [doc, runs, setRuns]);
 
-  const status = saved?.status ?? (decision ? initialStatus(decision.resolution) : null);
   const openCount = runs.filter((r) => isOpen(r.status)).length;
+  const phase: "intake" | "running" | "done" = saved ? "done" : running || stages.length ? "running" : "intake";
 
+  // ---------- State C: investigation ----------
+  if (phase === "done" && saved) {
+    return (
+      <Shell page="process" openCount={openCount}>
+        <Investigation
+          run={saved}
+          allRuns={runs}
+          previewSrc={doc?.pageImages[0]}
+          onUpdated={(r) => {
+            setSaved(r);
+            replace(r);
+          }}
+          notify={notify}
+          breadcrumb={
+            <>
+              <a href="/history">Invoices</a> / <span>{saved.invoice.invoiceNumber ?? saved.fileName}</span>
+            </>
+          }
+          extraHeader={
+            <div className="inv-after">
+              <span className="small muted">Just processed in {(saved.durationMs / 1000).toFixed(1)} s</span>
+              <button
+                className="btn btn-sm"
+                onClick={() => {
+                  reset();
+                  setDoc(null);
+                  setActiveSample(null);
+                }}
+              >
+                Process another invoice
+              </button>
+            </div>
+          }
+        />
+        {toast}
+      </Shell>
+    );
+  }
+
+  // ---------- State B: processing ----------
+  if (phase === "running" && doc) {
+    const active = stages.find((s) => s.status === "running");
+    return (
+      <Shell page="process" openCount={openCount}>
+        <div className="crumbs">
+          <a href="/process">Process invoice</a> / <span>{doc.fileName}</span>
+        </div>
+        <div className="inv-split" style={{ marginTop: 12 }}>
+          <DocumentPane src={doc.pageImages[0]} title={doc.fileName} meta={`${doc.pageCount} page${doc.pageCount > 1 ? "s" : ""} · ${doc.hasTextLayer ? "digital" : "no text layer"}`} />
+          <section className="running">
+            <div className="eyebrow">{error ? "Stopped" : running ? "Processing" : "Finishing"}</div>
+            <h1 className="display-sm">{invoice ? `${invoice.vendor} · ${money(invoice.total, invoice.currency)}` : "Reading the document…"}</h1>
+            <p className="muted">{active ? `Now: ${active.summary ?? ""}` : error ? "" : "Saving the decision…"}</p>
+            <Timeline stages={stages} live={running} />
+            {streaming && (
+              <div className="streambox">
+                <div className="eyebrow">Explanation (AI, written from the rule findings)</div>
+                <pre className="stream">
+                  {streaming}
+                  <span className="caret">▋</span>
+                </pre>
+              </div>
+            )}
+            {error && (
+              <div className="alert alert-err" role="alert">
+                <strong>System error, not a business rule.</strong> {error}
+                <div className="actions" style={{ marginTop: 10 }}>
+                  <button className="btn btn-primary btn-sm" onClick={run}>
+                    Try again
+                  </button>
+                  <button className="btn btn-sm" onClick={reset}>
+                    Back
+                  </button>
+                </div>
+              </div>
+            )}
+          </section>
+        </div>
+      </Shell>
+    );
+  }
+
+  // ---------- State A: intake ----------
   return (
     <Shell page="process" openCount={openCount}>
-      <PageHead title="Process invoice" sub="Upload a vendor invoice. Each control runs live and the decision comes with its evidence." />
-
-      <section className="card">
-        <div className="intake">
+      <div className="intake">
+        <section className="intake-main">
+          <div className="eyebrow">Process invoice</div>
+          <h1 className="display">Process an invoice</h1>
+          <p className="hero-sub">Each control runs live; the decision comes with its evidence and the next action.</p>
           <div
-            className={`drop ${dragOver ? "drop-on" : ""}`}
+            className={`dropzone ${dragOver ? "on" : ""} ${doc ? "has-doc" : ""}`}
+            role="button"
+            tabIndex={0}
             onClick={() => fileInput.current?.click()}
+            onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && fileInput.current?.click()}
             onDragOver={(e) => {
               e.preventDefault();
               setDragOver(true);
@@ -139,157 +215,67 @@ export default function Process() {
                 e.target.value = "";
               }}
             />
-            <div className="drop-title">Drop an invoice PDF or photo</div>
-            <div className="small muted">Digital, scanned or handwritten · click to browse</div>
-          </div>
-
-          {preparing ? (
-            <div className="doc">
-              <div className="skeleton doc-thumb" />
-              <div className="doc-meta" style={{ flex: 1 }}>
-                <div className="skeleton" style={{ height: 16, width: "70%" }} />
-                <div className="skeleton" style={{ height: 14, width: "50%" }} />
-              </div>
-            </div>
-          ) : doc ? (
-            <div className="doc">
-              <a href={doc.pageImages[0]} target="_blank" rel="noreferrer" title="Open full page">
-                <img src={doc.pageImages[0]} alt="Invoice preview" className="doc-thumb" />
-              </a>
-              <div className="doc-meta">
-                <div className="doc-name">{doc.fileName}</div>
-                <div className="small muted">{doc.hasTextLayer ? "Digital PDF · text layer found" : doc.mimeType === "application/pdf" ? "Scanned PDF · no text layer" : "Image · read visually"}</div>
-                <div className="small muted">
-                  {doc.pageCount} page{doc.pageCount > 1 ? "s" : ""}
+            {preparing ? (
+              <div className="dz-doc">
+                <div className="skeleton dz-thumb" />
+                <div style={{ flex: 1, display: "grid", gap: 8 }}>
+                  <div className="skeleton" style={{ height: 18, width: "60%" }} />
+                  <div className="skeleton" style={{ height: 14, width: "40%" }} />
                 </div>
               </div>
-            </div>
-          ) : (
-            <div className="doc muted small">No document selected. Drop a file or pick a demo scenario below.</div>
-          )}
-
-          <div className="intake-run">
-            <button className="btn btn-primary btn-lg" onClick={run} disabled={!doc || running || preparing}>
-              {running ? (
-                <>
-                  <span className="spinner" style={{ borderTopColor: "#fff" }} /> Processing…
-                </>
-              ) : (
-                <>Run process {Icon.arrow}</>
-              )}
-            </button>
-            <div className="small muted" style={{ textAlign: "center" }}>
-              8 controls · ~10–40 s
-            </div>
-          </div>
-        </div>
-        <div className="samples-bar">
-          <button className="link-btn" onClick={() => setShowSamples((s) => !s)}>
-            {showSamples ? "▾" : "▸"} Demo scenarios ({SAMPLES.length})
-          </button>
-          {showSamples && (
-            <div className="samples">
-              {SAMPLES.map((s) => (
-                <button key={s.file} className={`sample ${activeSample === s.file ? "sample-on" : ""}`} onClick={() => loadSample(s)} disabled={running || preparing}>
-                  <div className="row-between">
-                    <span className="sample-title">{s.title}</span>
-                    <StatusBadge status={resolutionToStatus(s.expect)} />
+            ) : doc ? (
+              <div className="dz-doc">
+                <img src={doc.pageImages[0]} alt="Selected invoice" className="dz-thumb" />
+                <div>
+                  <div className="dz-name">{doc.fileName}</div>
+                  <div className="muted small">
+                    {doc.hasTextLayer ? "Digital PDF · text layer found" : doc.mimeType === "application/pdf" ? "Scanned PDF · read from the image" : "Photo / image · read from the image"} · {doc.pageCount} page{doc.pageCount > 1 ? "s" : ""}
                   </div>
-                  <div className="sample-desc">{s.scenario}</div>
-                </button>
-              ))}
-            </div>
-          )}
-        </div>
-        {error && (
-          <div style={{ padding: "0 20px 16px" }}>
-            <div className="alert alert-err">
-              <strong>Processing error (system, not a business rule):</strong> {error}
-            </div>
-          </div>
-        )}
-      </section>
-
-      {stages.length > 0 && (
-        <div className="workspace">
-          <section className="card">
-            <div className="card-head">
-              <div className="card-title">Live processing</div>
-              <span className="small muted">{running ? "running" : stages.some((s) => s.status === "error") ? "stopped" : "complete"}</span>
-            </div>
-            <Timeline stages={stages} live={running} />
-          </section>
-
-          <section className="card">
-            {decision && invoice && status ? (
-              <>
-                <DecisionHeader
-                  status={status}
-                  invoice={invoice}
-                  decision={decision}
-                  findings={findings}
-                  vendorName={saved?.vendorMatched ?? null}
-                  run={saved ?? undefined}
-                  meta={saved ? "Decided by rules engine" : "Writing explanation…"}
-                />
-                <div style={{ padding: "14px 24px", borderBottom: "1px solid var(--border)" }} className="row-between">
-                  <ControlStrip findings={findings} />
-                  {saved && (
-                    <a className="btn btn-sm" href={`/invoice/${saved.id}?from=process`}>
-                      {resolutionToStatus(decision.resolution) === "approved" ? "Open invoice" : "Resolve exception"} {Icon.arrow}
-                    </a>
-                  )}
+                  <div className="link small" style={{ marginTop: 8 }}>
+                    Replace file
+                  </div>
                 </div>
-                <Tabs<Tab>
-                  value={tab}
-                  onChange={setTab}
-                  tabs={[
-                    { id: "findings", label: "Decision & findings", count: findings.filter((f) => f.action !== "info").length },
-                    { id: "evidence", label: "Validation evidence" },
-                    { id: "extracted", label: "Extracted data" },
-                    { id: "comms", label: "Vendor communication" },
-                  ]}
-                />
-                <div className="tab-body">
-                  {tab === "findings" && <FindingsList findings={findings} run={saved ?? undefined} />}
-                  {tab === "evidence" && (
-                    <div style={{ display: "grid", gap: 18 }}>
-                      <div>
-                        <div className="subhead" style={{ marginTop: 0 }}>Invoice vs purchase order</div>
-                        {result ? <PoComparison poMatch={result.poMatch} currency={invoice.currency} /> : <div className="skeleton" style={{ height: 80 }} />}
-                      </div>
-                      <div>
-                        <div className="subhead">Vendor identity and bank account</div>
-                        <VendorEvidence run={{ invoice, vendorId: saved?.vendorId ?? null, findings }} />
-                      </div>
-                      {saved && (
-                        <div>
-                          <div className="subhead">Duplicate check</div>
-                          <DuplicateEvidence run={saved} />
-                        </div>
-                      )}
-                    </div>
-                  )}
-                  {tab === "extracted" && <ExtractedData invoice={invoice} extractionMethod={saved?.extractionMethod} />}
-                  {tab === "comms" && <VendorComms explanation={result?.explanation} streaming={streaming} status={status} />}
-                </div>
-              </>
+              </div>
             ) : (
-              <div className="card-pad">
-                <div className="card-title" style={{ marginBottom: 12 }}>
-                  Decision
-                </div>
-                <div className="skeleton" style={{ height: 28, width: 160, marginBottom: 12 }} />
-                <div className="skeleton" style={{ height: 18, width: "80%", marginBottom: 8 }} />
-                <div className="skeleton" style={{ height: 18, width: "60%" }} />
-                <div className="small muted" style={{ marginTop: 14 }}>
-                  {stages.find((s) => s.status === "running")?.id === "extract" ? "Reading the document…" : "Running controls…"}
-                </div>
+              <div className="dz-empty">
+                <div className="dz-icon">{Icon.process}</div>
+                <div className="dz-title">Drop an invoice here, or click to browse</div>
+                <div className="muted small">PDF (digital or scanned) or a photo · up to 3 pages are read</div>
               </div>
             )}
-          </section>
-        </div>
-      )}
+          </div>
+          {error && (
+            <div className="alert alert-err" role="alert" style={{ marginTop: 12 }}>
+              {error}
+            </div>
+          )}
+          <div className="intake-go">
+            <button className="btn btn-primary btn-xl" onClick={run} disabled={!doc || preparing}>
+              Run process {Icon.arrow}
+            </button>
+            <span className="muted small">8 controls · decision in ~10–40 s</span>
+          </div>
+        </section>
+
+        <aside className="intake-samples" aria-label="Demo invoices">
+          <div className="eyebrow">Or pick a demo invoice</div>
+          <ul className="samples">
+            {SAMPLES.map((s, i) => (
+              <li key={s.file}>
+                <button className={`sample ${activeSample === s.file ? "on" : ""}`} onClick={() => loadSample(s)} disabled={preparing}>
+                  <span className="sample-n">{i + 1}</span>
+                  <span className="sample-body">
+                    <span className="sample-title">{s.title}</span>
+                    <span className="sample-desc">{s.scenario}</span>
+                  </span>
+                  <StatusBadge status={resolutionToStatus(s.expect)} />
+                </button>
+              </li>
+            ))}
+          </ul>
+          <p className="muted small">Expected outcome shown on the right; each runs through the real pipeline.</p>
+        </aside>
+      </div>
     </Shell>
   );
 }

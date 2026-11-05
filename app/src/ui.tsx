@@ -7,11 +7,11 @@ import type { CaseStatus, CheckAction, Resolution, RunRecord } from "./types";
 
 // Validated as a set for charts; always shown with a text label.
 export const STATUS_COLOR: Record<CaseStatus, string> = {
-  approved: "#14a06f",
-  needs_review: "#e9a23b",
-  awaiting_info: "#e9a23b",
-  payment_hold: "#d9622b",
-  rejected: "#8e1d2c",
+  approved: "#2e7d50",
+  needs_review: "#d6a22a",
+  awaiting_info: "#d6a22a",
+  payment_hold: "#c4501f",
+  rejected: "#a0215c",
 };
 
 export const resolutionToStatus = (r: Resolution): CaseStatus =>
@@ -71,13 +71,33 @@ export function useRuns() {
   return { runs, loaded, error, reload, replace, setRuns };
 }
 
+// One demo reviewer identity shared by every panel on the page.
+const reviewerListeners = new Set<(s: string) => void>();
 export function useReviewer(): [string, (s: string) => void] {
   const [name, setName] = useState(() => localStorage.getItem("demo_reviewer") ?? "");
+  useEffect(() => {
+    reviewerListeners.add(setName);
+    return () => {
+      reviewerListeners.delete(setName);
+    };
+  }, []);
   return [
     name,
     (s: string) => {
-      setName(s);
       localStorage.setItem("demo_reviewer", s);
+      reviewerListeners.forEach((fn) => fn(s));
+    },
+  ];
+}
+
+// Decision view (default) vs Detailed view; remembered per browser.
+export function useViewMode(): ["decision" | "detailed", (v: "decision" | "detailed") => void] {
+  const [v, setV] = useState<"decision" | "detailed">(() => (localStorage.getItem("view_mode") === "detailed" ? "detailed" : "decision"));
+  return [
+    v,
+    (n) => {
+      setV(n);
+      localStorage.setItem("view_mode", n);
     },
   ];
 }

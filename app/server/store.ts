@@ -5,6 +5,7 @@ import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { RunRecord } from "../src/types.ts";
 import { applyReviewAction, type ReviewRequest } from "../src/lib/review.ts";
+import { applyCorrections, type CorrectionRequest } from "../src/lib/revalidate.ts";
 
 const DATA_DIR = process.env.DATA_DIR ?? join(process.cwd(), "data");
 const FILE = join(DATA_DIR, "runs.json");
@@ -71,6 +72,18 @@ export async function actOnRun(id: string, req: ReviewRequest): Promise<{ status
   const idx = runs.findIndex((r) => r.id === id);
   if (idx < 0) return { status: 404, body: { error: "run not found" } };
   const result = applyReviewAction(runs[idx], req);
+  if (!result.ok) return { status: 409, body: { error: result.error } };
+  const next = [...runs];
+  next[idx] = result.run;
+  await persist(next);
+  return { status: 200, body: result.run };
+}
+
+export async function correctRun(id: string, req: CorrectionRequest): Promise<{ status: number; body: unknown }> {
+  const runs = await load();
+  const idx = runs.findIndex((r) => r.id === id);
+  if (idx < 0) return { status: 404, body: { error: "run not found" } };
+  const result = applyCorrections(runs[idx], req, runs);
   if (!result.ok) return { status: 409, body: { error: result.error } };
   const next = [...runs];
   next[idx] = result.run;

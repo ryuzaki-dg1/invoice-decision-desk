@@ -2,7 +2,7 @@
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { forwardChat, forwardChatStream, getHealth } from "./proxy.ts";
-import { actOnRun, addRun, clearRuns, listRuns, readPreview } from "./store.ts";
+import { actOnRun, addRun, clearRuns, correctRun, listRuns, readPreview } from "./store.ts";
 
 async function readJson(req: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
@@ -65,6 +65,10 @@ export async function handleApi(req: IncomingMessage, res: ServerResponse): Prom
         res.setHeader("Cache-Control", "private, max-age=3600");
         res.end(doc.data);
       }
+    } else if (/^\/api\/runs\/[^/]+\/corrections$/.test(url) && req.method === "POST") {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const result = await correctRun(decodeURIComponent(url.split("/")[3]), (await readJson(req)) as any);
+      sendJson(res, result.status, result.body);
     } else if (/^\/api\/runs\/[^/]+\/actions$/.test(url) && req.method === "POST") {
       const id = decodeURIComponent(url.split("/")[3]);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any

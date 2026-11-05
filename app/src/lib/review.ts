@@ -12,7 +12,7 @@
 
 import type { AuditEvent, CaseStatus, ExceptionCode, RunRecord } from "../types.ts";
 
-export type ReviewActionId = "verify_bank" | "confirm_po" | "approve" | "request_info" | "keep_on_hold" | "reject";
+export type ReviewActionId = "verify_bank" | "confirm_po" | "confirm_fields" | "approve" | "request_info" | "keep_on_hold" | "reject";
 
 export interface ReviewRequest {
   action: ReviewActionId;
@@ -47,6 +47,9 @@ export function availableActions(run: RunRecord): ActionOption[] {
   if (has("BANK_ACCOUNT_MISMATCH")) {
     out.push({ id: "verify_bank", label: "Record independent bank verification", allowed: true, needsVerification: true, tone: "primary" });
   }
+  if (has("HANDWRITTEN_DOCUMENT") || has("LOW_EXTRACTION_CONFIDENCE")) {
+    out.push({ id: "confirm_fields", label: "Confirm figures match the document", allowed: true, tone: "primary" });
+  }
   if (has("PO_MATCH_UNCONFIRMED")) {
     out.push({ id: "confirm_po", label: `Confirm suggested PO ${run.poMatch.po?.id ?? ""}`.trim(), allowed: true, tone: "primary" });
   }
@@ -55,6 +58,8 @@ export function availableActions(run: RunRecord): ActionOption[] {
   if (hardBlock === "UNKNOWN_VENDOR") approveBlock = "Vendor is not in the vendor master. Procurement must onboard it before any approval.";
   else if (hardBlock) approveBlock = "An unresolvable control is open (vendor or duplicate).";
   else if (has("BANK_ACCOUNT_MISMATCH")) approveBlock = "Record independent bank verification first.";
+  else if (has("ARITHMETIC_MISMATCH") || has("MISSING_FIELD")) approveBlock = "The invoice still doesn't reconcile or is missing required fields. Correct the fields, or request a corrected invoice.";
+  else if (has("HANDWRITTEN_DOCUMENT") || has("LOW_EXTRACTION_CONFIDENCE")) approveBlock = "Confirm the figures against the original document first.";
   else if (has("PO_MATCH_UNCONFIRMED")) approveBlock = "Confirm the suggested PO first.";
   out.push({ id: "approve", label: open.length ? "Approve (issues resolved)" : "Approve", allowed: !approveBlock, blockedReason: approveBlock, tone: "primary" });
 
@@ -73,6 +78,7 @@ export function availableActions(run: RunRecord): ActionOption[] {
 const ACTION_TEXT: Record<ReviewActionId, string> = {
   verify_bank: "Recorded independent bank verification",
   confirm_po: "Confirmed suggested PO",
+  confirm_fields: "Confirmed extracted figures against the original document",
   approve: "Approved after review",
   request_info: "Requested clarification from vendor",
   keep_on_hold: "Kept on hold",
@@ -109,6 +115,10 @@ export function applyReviewAction(run: RunRecord, req: ReviewRequest, now = Date
       break;
     case "confirm_po":
       resolved = [...resolved, "PO_MATCH_UNCONFIRMED"];
+      to = statusAfterResolve(run, resolved);
+      break;
+    case "confirm_fields":
+      resolved = [...resolved, "HANDWRITTEN_DOCUMENT", "LOW_EXTRACTION_CONFIDENCE"];
       to = statusAfterResolve(run, resolved);
       break;
     case "approve":
