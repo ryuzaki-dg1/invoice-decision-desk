@@ -77,3 +77,9 @@ On Railway or Render, point the service at the `app` folder (Dockerfile build) a
 - The PO table and vendor master are static files standing in for an ERP; run history is a JSON file. Production would use the ERP API and a database.
 - Invoices arrive by upload; an email inbox listener would call the same pipeline.
 - Up to 3 pages per invoice are sent to the model.
+- Model: Gemini 3.5 Flash by default. If a model is busy or rate-limited (503/429), the server retries once and then falls back through `gemini-3.8-flash`, `gemini-flash-latest` and `gemini-3.5-flash-lite`. The decision never depends on which model answered, because the model only reads and explains.
+
+## Testing
+
+- `npm test` runs the decision engine on every scenario, with fields as the model would extract them, so no API calls are made.
+- `node scripts/e2e.mjs` drives the real UI in Edge through all six demo invoices with the live model and checks each decision. It clears run history first.
