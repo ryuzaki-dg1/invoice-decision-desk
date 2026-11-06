@@ -134,6 +134,18 @@ export interface BillingSummary {
   priorInvoices: string[]; // confirmed: paid or approved
   pendingOnPo: number; // other invoices on this PO still in review / on hold
   pendingInvoices: string[];
+  // Ledger rows behind the totals (confirmed first, then pending).
+  ledger?: { invoiceNumber: string; issueDate: string; total: number; status: LedgerInvoice["status"]; source: "erp" | "run"; confirmed: boolean }[];
+}
+
+// Position of a piece of text on page 1, as fractions of the page (0..1).
+// Only available for PDFs with a real text layer.
+export interface TextBox {
+  s: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
 }
 
 export interface LineCheck {
@@ -229,6 +241,7 @@ export interface RunRecord {
   // Controls a reviewer has explicitly resolved (e.g. bank change verified, PO confirmed).
   resolvedCodes: ExceptionCode[];
   hasPreview: boolean; // first page image stored on the server
+  textBoxes?: TextBox[]; // page-1 text positions from the PDF text layer (digital PDFs only)
   repeatSubmission: boolean;
   duplicateOf?: DuplicateRef;
   audit: AuditEvent[];

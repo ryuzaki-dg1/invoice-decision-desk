@@ -23,7 +23,7 @@ export function VendorBankEvidence({ run }: { run: RunRecord }) {
   const bankBad = has(run, "BANK_ACCOUNT_MISMATCH");
   const bankResolved = (run.resolvedCodes ?? []).includes("BANK_ACCOUNT_MISMATCH");
   return (
-    <div className={`ev ${!v || bankBad ? "ev-alert" : ""}`}>
+    <div className={`ev ${!v || bankBad ? "ev-alert" : ""}`} id="ev-vendor">
       <div className="ev-head">
         <span className="ev-title">Vendor & bank account</span>
         {!v ? <span className="ev-flag ev-flag-hold">Not in vendor master</span> : bankBad ? <span className={`ev-flag ${bankResolved ? "ev-flag-ok" : "ev-flag-hold"}`}>{bankResolved ? "Change verified" : "Account mismatch"}</span> : <span className="ev-flag ev-flag-ok">Verified</span>}
@@ -64,7 +64,7 @@ export function PoEvidence({ run }: { run: RunRecord }) {
   const c = run.invoice.currency;
   if (!po || !b) {
     return (
-      <div className="ev ev-alert">
+      <div className="ev ev-alert" id="ev-po">
         <div className="ev-head">
           <span className="ev-title">Purchase order</span>
           <span className="ev-flag ev-flag-warn">No PO matched</span>
@@ -73,81 +73,148 @@ export function PoEvidence({ run }: { run: RunRecord }) {
       </div>
     );
   }
+  // PO utilisation, every segment computed from the stored ledger:
+  //   billed before (confirmed: paid or approved) | this invoice within the PO | this invoice over the PO
+  // Pending invoices (in review / on hold) are shown separately and never counted as spend.
   const variance = b.billedAfter - b.poTotal;
   const ceiling = b.poTotal * (1 + b.tolerancePct);
   const exceeds = b.billedAfter > ceiling + 0.005;
-  const flag = exceeds ? ["Exceeds tolerance", "ev-flag-warn"] : variance > 0.005 ? ["Within tolerance", "ev-flag-ok"] : b.remainingAfter > 0.005 ? ["Within PO", "ev-flag-ok"] : ["Matches PO", "ev-flag-ok"];
-  const scale = Math.max(ceiling, b.billedAfter + (b.pendingOnPo ?? 0)) * 1.02;
+  const overPo = Math.max(0, b.billedAfter - Math.max(b.poTotal, b.previouslyBilled));
+  const thisWithin = Math.max(0, b.thisInvoice - overPo);
+  const flag = exceeds ? ["Exceeds PO + tolerance", "ev-flag-warn"] : variance > 0.005 ? ["Over PO, within tolerance", "ev-flag-ok"] : b.remainingAfter > 0.005 ? ["Within PO", "ev-flag-ok"] : ["Uses the full PO", "ev-flag-ok"];
+  const scale = Math.max(ceiling, b.billedAfter + (b.pendingOnPo ?? 0)) * 1.04;
   const w = (n: number) => `${Math.max(0, (n / scale) * 100)}%`;
-  const cumulative = b.previouslyBilled > 0;
+  const ledger = b.ledger ?? b.priorInvoices.map((n) => ({ invoiceNumber: n, issueDate: "—", total: NaN, status: "paid" as const, source: "erp" as const, confirmed: true }));
+  const statusText = (s: string, src: string) => (s === "paid" ? "Paid (ERP record)" : s === "approved" ? "Approved, not yet paid" : src === "run" ? "Pending review / hold" : s);
+  const qtyLines = (lines ?? []).filter((l) => l.poQty !== null);
   return (
-    <div className={`ev ${exceeds ? "ev-alert" : ""}`}>
+    <div className={`ev ${exceeds ? "ev-alert" : ""}`} id="ev-po">
       <div className="ev-head">
         <span className="ev-title">
-          Invoice vs {po.id} {method === "inferred" && <span className="ev-flag ev-flag-warn">suggested match, unconfirmed</span>}
+          PO utilisation · {po.id} {method === "inferred" && <span className="ev-flag ev-flag-warn">suggested match, unconfirmed</span>}
         </span>
         <span className={`ev-flag ${flag[1]}`}>{flag[0]}</span>
       </div>
       <div className="figs">
-        <Fig k="PO value" v={money(b.poTotal, c)} />
-        {cumulative && <Fig k={`Previously billed`} v={money(b.previouslyBilled, c)} sub={b.priorInvoices.join(", ")} />}
+        <Fig k="Authorised PO value" v={money(b.poTotal, c)} />
+        <Fig k="Billed before" v={money(b.previouslyBilled, c)} sub={b.priorInvoices.length ? `${b.priorInvoices.length} invoice${b.priorInvoices.length > 1 ? "s" : ""} · confirmed` : "none"} />
         <Fig k="This invoice" v={money(b.thisInvoice, c)} />
-        {cumulative && <Fig k="Cumulative" v={money(b.billedAfter, c)} />}
-        <Fig k="Variance" v={`${variance >= 0 ? "+" : "−"}${money(Math.abs(variance), c)}`} sub={fmtPct(b.poTotal ? variance / b.poTotal : 0)} tone={exceeds ? "bad" : undefined} />
-        <Fig k="Tolerance" v={fmtPct(b.tolerancePct, false)} sub={`up to ${money(ceiling, c)}`} />
+        <Fig k="Cumulative" v={money(b.billedAfter, c)} sub={fmtPct(b.poTotal ? b.billedAfter / b.poTotal - 1 : 0) + " vs PO"} tone={exceeds ? "bad" : undefined} />
+        <Fig k={variance > 0.005 ? "Over the PO" : "Remaining"} v={money(Math.abs(b.remainingAfter), c)} tone={exceeds ? "bad" : undefined} />
+        <Fig k="Tolerance" v={fmtPct(b.tolerancePct, false)} sub={`ceiling ${money(ceiling, c)}`} />
       </div>
-      <div className="meter" role="img" aria-label={`Billed ${money(b.billedAfter, c)} of PO ${money(b.poTotal, c)}`}>
-        {cumulative && <span className="meter-prev" style={{ width: w(b.previouslyBilled) }} title={`Previously billed ${money(b.previouslyBilled, c)}`} />}
-        <span className={exceeds ? "meter-over" : "meter-this"} style={{ width: w(b.thisInvoice) }} title={`This invoice ${money(b.thisInvoice, c)}`} />
-        {b.pendingOnPo > 0 && <span className="meter-pend" style={{ width: w(b.pendingOnPo) }} title={`Pending, not committed ${money(b.pendingOnPo, c)}`} />}
-        <span className="meter-tol" style={{ left: w(b.poTotal), width: w(ceiling - b.poTotal) }} />
-        <span className="meter-po" style={{ left: w(b.poTotal) }} />
+      <div className="util-bar" role="img" aria-label={`Billed before ${money(b.previouslyBilled, c)}, this invoice ${money(b.thisInvoice, c)}, PO ${money(b.poTotal, c)}${overPo ? `, ${money(overPo, c)} over` : ""}`}>
+        {b.previouslyBilled > 0 && (
+          <span className="ub-prev" style={{ width: w(b.previouslyBilled) }} title={`Billed before ${money(b.previouslyBilled, c)}`}>
+            {b.previouslyBilled / scale > 0.16 && <em>{money(b.previouslyBilled, c)}</em>}
+          </span>
+        )}
+        {thisWithin > 0 && (
+          <span className="ub-this" style={{ width: w(thisWithin) }} title={`This invoice within the PO ${money(thisWithin, c)}`}>
+            {thisWithin / scale > 0.14 && <em>{money(thisWithin, c)}</em>}
+          </span>
+        )}
+        {overPo > 0.005 && (
+          <span className={exceeds ? "ub-over" : "ub-tol-over"} style={{ width: w(overPo) }} title={`Over the authorised PO ${money(overPo, c)}`}>
+            {overPo / scale > 0.1 && <em>+{money(overPo, c)}</em>}
+          </span>
+        )}
+        {b.pendingOnPo > 0 && <span className="ub-pend" style={{ width: w(b.pendingOnPo) }} title={`Pending, not committed ${money(b.pendingOnPo, c)}`} />}
+        <span className="ub-tol" style={{ left: w(b.poTotal), width: w(ceiling - b.poTotal) }} title={`Tolerance up to ${money(ceiling, c)}`} />
+        <span className="ub-po" style={{ left: w(b.poTotal) }}>
+          <small>PO {money(b.poTotal, c)}</small>
+        </span>
       </div>
       <div className="meter-legend">
-        {cumulative && (
+        {b.previouslyBilled > 0 && (
           <span>
-            <i className="sw meter-prev" /> previously billed
+            <i className="sw ub-prev" /> billed before (confirmed)
           </span>
         )}
         <span>
-          <i className={`sw ${exceeds ? "meter-over" : "meter-this"}`} /> this invoice
+          <i className="sw ub-this" /> this invoice
         </span>
+        {overPo > 0.005 && (
+          <span>
+            <i className={`sw ${exceeds ? "ub-over" : "ub-tol-over"}`} /> over the authorised value
+          </span>
+        )}
         {b.pendingOnPo > 0 && (
           <span>
-            <i className="sw meter-pend" /> pending, not committed ({b.pendingInvoices.join(", ")})
+            <i className="sw ub-pend" /> pending, not counted ({b.pendingInvoices.join(", ")})
           </span>
         )}
         <span>
-          <i className="sw sw-line" /> PO value · hatched = tolerance
+          <i className="sw ub-tol" /> tolerance band
         </span>
-        <span className="grow" />
-        <span className="tabnum">{b.remainingAfter >= 0 ? `${money(b.remainingAfter, c)} left on PO` : `${money(-b.remainingAfter, c)} over PO`}</span>
       </div>
-      {lines && lines.some((l) => l.status !== "ok" || l.priorQty > 0) && (
+      {qtyLines.length > 0 && qtyLines.some((l) => l.status !== "ok" || l.priorQty > 0) && (
         <table className="tbl tbl-sm" style={{ marginTop: 12 }}>
           <thead>
             <tr>
               <th>Line</th>
               <th className="num">Ordered</th>
-              <th className="num">Prev. billed</th>
-              <th className="num">This inv.</th>
-              <th className="num">PO price</th>
-              <th className="num">Inv. price</th>
+              <th className="num">Billed before</th>
+              <th className="num">This invoice</th>
+              <th className="num">Total billed</th>
+              <th className="num">Excess</th>
+              <th className="num">PO / inv. price</th>
             </tr>
           </thead>
           <tbody>
-            {lines.map((l, i) => (
-              <tr key={i} className={l.status !== "ok" ? "tr-bad" : ""}>
-                <td>{l.description}</td>
-                <td className="num">{l.poQty ?? "—"}</td>
-                <td className="num">{l.priorQty}</td>
-                <td className="num">{l.invoiceQty}</td>
-                <td className="num">{l.poUnitPrice !== null ? money(l.poUnitPrice, c) : "—"}</td>
-                <td className="num">{money(l.invoiceUnitPrice, c)}</td>
-              </tr>
-            ))}
+            {qtyLines.map((l, i) => {
+              const total = l.priorQty + l.invoiceQty;
+              const excess = Math.max(0, total - (l.poQty ?? 0));
+              return (
+                <tr key={i} className={l.status !== "ok" ? "tr-bad" : ""}>
+                  <td>{l.description}</td>
+                  <td className="num">{l.poQty}</td>
+                  <td className="num">{l.priorQty}</td>
+                  <td className="num">{l.invoiceQty}</td>
+                  <td className="num strong">{total}</td>
+                  <td className={`num ${excess ? "t-bad strong" : "muted"}`}>{excess || "—"}</td>
+                  <td className={`num ${l.status === "price_over" ? "t-bad" : ""}`}>
+                    {l.poUnitPrice !== null ? money(l.poUnitPrice, c) : "—"} / {money(l.invoiceUnitPrice, c)}
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
+      )}
+      {(ledger.length > 0 || b.previouslyBilled > 0) && (
+        <details className="ledger">
+          <summary>Invoices on this PO ({ledger.length + 1}) · each counted once; rejected duplicates excluded</summary>
+          <table className="tbl tbl-sm">
+            <thead>
+              <tr>
+                <th>Invoice</th>
+                <th>Date</th>
+                <th>Status</th>
+                <th className="num">Amount</th>
+                <th className="num">Counts as spend</th>
+              </tr>
+            </thead>
+            <tbody>
+              {ledger.map((l) => (
+                <tr key={l.invoiceNumber}>
+                  <td className="mono">{l.invoiceNumber}</td>
+                  <td className="tabnum">{l.issueDate}</td>
+                  <td>{statusText(l.status, l.source)}</td>
+                  <td className="num">{Number.isFinite(l.total) ? money(l.total, c) : "—"}</td>
+                  <td className="num">{l.confirmed ? "Yes" : "No (pending)"}</td>
+                </tr>
+              ))}
+              <tr className="ledger-cur">
+                <td className="mono">{run.invoice.invoiceNumber ?? "this invoice"}</td>
+                <td className="tabnum">{run.invoice.issueDate ?? "—"}</td>
+                <td>This invoice</td>
+                <td className="num">{money(b.thisInvoice, c)}</td>
+                <td className="num">If approved</td>
+              </tr>
+            </tbody>
+          </table>
+        </details>
       )}
     </div>
   );
@@ -181,7 +248,7 @@ export function DuplicateEvidence({ run }: { run: RunRecord }) {
   const c = run.invoice.currency;
   const status = d.status === "paid" ? "Paid · payment record in ERP" : d.status === "approved" ? "Approved for payment · not yet paid" : "Under review";
   return (
-    <div className="ev ev-alert">
+    <div className="ev ev-alert" id="ev-dup">
       <div className="ev-head">
         <span className="ev-title">Duplicate of {d.invoiceNumber}</span>
         <span className="ev-flag ev-flag-bad">No second payable</span>
@@ -241,7 +308,7 @@ export function ArithmeticEvidence({ run }: { run: RunRecord }) {
     ...(inv.discount ? ([["Discount", -inv.discount]] as [string, number][]) : []),
   ];
   return (
-    <div className={`ev ${bad ? "ev-alert" : ""}`}>
+    <div className={`ev ${bad ? "ev-alert" : ""}`} id="ev-math">
       <div className="ev-head">
         <span className="ev-title">Invoice arithmetic</span>
         <span className={`ev-flag ${bad ? "ev-flag-warn" : "ev-flag-ok"}`}>{bad ? "Does not reconcile" : "Reconciles"}</span>
@@ -276,22 +343,23 @@ export function ArithmeticEvidence({ run }: { run: RunRecord }) {
 }
 
 // Which patterns to show, most relevant first.
-export function EvidenceStack({ run, limit }: { run: RunRecord; limit?: number }) {
+// Summary view shows the evidence behind every finding that is still relevant
+// (most severe first); Detailed view shows all of it.
+export function EvidenceStack({ run, relevantOnly }: { run: RunRecord; relevantOnly?: boolean }) {
   const blocks: { key: string; node: React.ReactNode; weight: number }[] = [];
   const open = (code: string) => run.findings.some((f) => f.code === code && f.action !== "info");
   if (run.duplicateOf || run.repeatSubmission) blocks.push({ key: "dup", node: <DuplicateEvidence run={run} />, weight: 4 });
   blocks.push({ key: "vendor", node: <VendorBankEvidence run={run} />, weight: open("BANK_ACCOUNT_MISMATCH") || open("UNKNOWN_VENDOR") ? 3 : 0 });
   blocks.push({ key: "po", node: <PoEvidence run={run} />, weight: ["CUMULATIVE_PO_EXCEEDED", "PO_AMOUNT_EXCEEDED", "PO_MATCH_UNCONFIRMED", "QUANTITY_EXCEEDS_PO", "PENDING_PO_CONFLICT", "PRICE_VARIANCE"].some(open) ? 2 : 1 });
   blocks.push({ key: "math", node: <ArithmeticEvidence run={run} />, weight: open("ARITHMETIC_MISMATCH") ? 2.5 : -1 });
+  const sorted = blocks.filter((b) => b.weight >= 0).sort((a, b) => b.weight - a.weight);
+  const relevant = sorted.filter((b) => b.weight >= 2);
+  const shown = !relevantOnly ? sorted : relevant.length ? relevant : sorted.slice(0, 1);
   return (
     <div className="ev-stack">
-      {blocks
-        .filter((b) => b.weight >= 0)
-        .sort((a, b) => b.weight - a.weight)
-        .slice(0, limit ?? 99)
-        .map((b) => (
-          <div key={b.key}>{b.node}</div>
-        ))}
+      {shown.map((b) => (
+        <div key={b.key}>{b.node}</div>
+      ))}
     </div>
   );
 }

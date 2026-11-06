@@ -218,8 +218,8 @@ function CaseRow({ c }: { c: InvoiceCase }) {
               <li key={a.id} tabIndex={0} onClick={() => go(a.id, "overview")} onKeyDown={(e) => e.key === "Enter" && go(a.id, "overview")}>
                 <span className="muted">Attempt {i + 1}</span>
                 <span>{fmtDate(a.createdAt)}</span>
-                <StatusBadge status={a.status} />
-                <span className="muted small">{a.repeatSubmission ? "Repeat of an invoice already on file" : f ? SHORT[f.code] ?? REASON_LABEL[f.code] : "All checks passed"}</span>
+                {a.duplicateOf ? <span className="badge st-dup">Duplicate blocked</span> : <StatusBadge status={a.status} />}
+                <span className="muted small">{a.duplicateOf ? "No second payable created; the original case is unaffected" : f ? SHORT[f.code] ?? REASON_LABEL[f.code] : "All checks passed"}</span>
               </li>
             );
           })}

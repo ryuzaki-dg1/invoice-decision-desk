@@ -5,7 +5,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { ArrowLeft, CircleCheckBig, Inbox } from "lucide-react";
 import { ACTION_GROUPS } from "../copy";
-import { DocumentViewer, Investigation } from "../investigation";
+import { DocumentViewer, Investigation, type Highlight } from "../investigation";
 import { money } from "../lib/engine";
 import { Shell } from "../Shell";
 import { AttentionRow, prioritise } from "../tables";
@@ -25,10 +25,34 @@ export default function Queue() {
   }, [loaded, selectedId, shown]);
   const selected = runs.find((r) => r.id === selectedId) ?? null;
   const value = queue.reduce((s, r) => s + (r.invoice.total ?? 0), 0);
+  const [hl, setHl] = useState<Highlight | null>(null);
   const select = (id: string) => {
     setSelectedId(id);
+    setHl(null);
     window.history.replaceState(null, "", `/queue?run=${id}`);
   };
+  // Keyboard: ↑/↓ or j/k move between invoices, d toggles the document, Esc closes it.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement;
+      if (t.closest("input, textarea, select, [contenteditable]") || e.metaKey || e.ctrlKey || e.altKey) return;
+      const idx = shown.findIndex((r) => r.id === selectedId);
+      if ((e.key === "ArrowDown" || e.key === "j") && shown.length) {
+        e.preventDefault();
+        select(shown[Math.min(shown.length - 1, idx + 1)].id);
+      } else if ((e.key === "ArrowUp" || e.key === "k") && shown.length) {
+        e.preventDefault();
+        select(shown[Math.max(0, idx - 1)].id);
+      } else if (e.key === "d" && selectedId) {
+        setDocOpen((v) => !v);
+      } else if (e.key === "Escape") {
+        setDocOpen(false);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [shown, selectedId]);
 
   return (
     <Shell page="queue" openCount={queue.length} wide>
@@ -44,6 +68,8 @@ export default function Queue() {
               title={selected.fileName}
               meta={`${selected.pageCount} page${selected.pageCount > 1 ? "s" : ""} · ${selected.invoice.documentType}`}
               sticky={false}
+              highlight={hl}
+              onClearHighlight={() => setHl(null)}
             />
           </aside>
         ) : (
@@ -77,13 +103,28 @@ export default function Queue() {
                 shown.map((r) => <AttentionRow key={r.id} r={r} compact selected={r.id === selectedId} onOpen={() => select(r.id)} />)
               )}
             </div>
-            <p className="ws-foot muted small">Ordered by severity, then amount, then waiting time.</p>
+            <p className="ws-foot muted small">
+              Ordered by severity, then amount, then waiting time · <kbd>↑</kbd>
+              <kbd>↓</kbd> move · <kbd>d</kbd> document
+            </p>
           </aside>
         )}
         <section className="ws-detail" aria-live="polite">
           {selected ? (
             <div className="card ws-card">
-              <Investigation key={selected.id} run={selected} allRuns={runs} embedded onUpdated={replace} notify={notify} onViewDocument={() => setDocOpen((v) => !v)} />
+              <Investigation
+                key={selected.id}
+                run={selected}
+                allRuns={runs}
+                embedded
+                onUpdated={replace}
+                notify={notify}
+                onViewDocument={() => setDocOpen((v) => !v)}
+                onHighlight={(h) => {
+                  setHl(h);
+                  if (h) setDocOpen(true);
+                }}
+              />
             </div>
           ) : (
             <div className="card">

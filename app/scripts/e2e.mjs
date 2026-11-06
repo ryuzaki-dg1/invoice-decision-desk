@@ -27,6 +27,8 @@ const CASES = [
   ["BL-2291", "Payment hold"],
 ];
 
+// Demo cards are labelled by scenario name.
+const CARD = { "INV-1047": "Routine invoice", "SC-3390": "Split PO billing", "scanned copy": "Duplicate resubmission", "handwritten bill": "Handwritten invoice", "INV-1052": "Bank account change", "BL-2291": "Unknown vendor" };
 const browser = await chromium.launch({ channel: "msedge", headless: true });
 const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
 page.on("pageerror", (e) => console.log("  [page error]", e.message));
@@ -63,7 +65,7 @@ await page.goto(`${base}/`);
 check((await page.locator(".kpi-value").first().innerText()) === "0", "Reset: Overview shows 0 unique invoices");
 await page.route("**/api/chat", (r) => r.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ error: { code: 503, message: "This model is currently experiencing high demand." } }) }));
 await page.goto(`${base}/process`);
-await page.locator(".demo", { hasText: "INV-1047" }).click();
+await page.locator(".demo", { hasText: CARD["INV-1047"] }).click();
 await page.locator("img.drop-thumb").waitFor();
 await page.locator(".btn-primary", { hasText: "Run process" }).click();
 await page.locator(".sys-err").waitFor({ timeout: 30000 });
@@ -77,7 +79,7 @@ async function runCase(ref, expected, label, retry = false) {
   const t0 = Date.now();
   if (!retry) {
     await page.goto(`${base}/process`);
-    await page.locator(".demo", { hasText: ref }).click();
+    await page.locator(".demo", { hasText: CARD[ref] ?? ref }).click();
     await page.locator("img.drop-thumb").waitFor({ timeout: 30000 });
     await page.locator(".btn-primary", { hasText: "Run process" }).click();
   } else {
@@ -155,8 +157,70 @@ const r1 = (await runs()).find((r) => r.id === rao.id);
 check(r1.status === "needs_review", `Confirming fields does not auto-approve (status ${r1.status})`);
 await act("Approve", "Figures confirmed; PO assigned by plant manager");
 
+// ---- 5b) A real uploaded invoice with TWO controls (bank + PO): checklist sequence ----
+const bpFile = path.join(here, "tmp", "bluepeak-upload.png");
+if (fs.existsSync(bpFile)) {
+  const t0 = Date.now();
+  await page.goto(`${base}/process`);
+  await page.locator('input[type="file"]').setInputFiles(bpFile);
+  await page.locator("img.drop-thumb").waitFor({ timeout: 30000 });
+  await page.locator(".btn-primary", { hasText: "Run process" }).click();
+  await waitDone();
+  if (await page.locator(".sys-err").isVisible()) {
+    await page.locator(".btn", { hasText: "Retry with the same document" }).click();
+    await waitDone();
+  }
+  const got = (await page.locator(".inv-head .badge-lg").innerText().catch(() => "")).trim();
+  check(/payment hold/i.test(got), `Uploaded Bluepeak invoice: ${got} · ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+  const bp = (await runs()).find((r) => r.invoice.invoiceNumber === "INV-4471");
+  await page.goto(`${base}/queue?run=${bp.id}`);
+  await page.locator(".ctl").waitFor();
+  const foot0 = await page.locator(".ctl-foot").innerText();
+  check(/2 unresolved controls/.test(foot0) && /locked/i.test(foot0), `Checklist: "${foot0.trim()}"`);
+  await shot("bluepeak-checklist-before");
+  await page.locator(".ctl .btn", { hasText: "Verify payment details" }).click();
+  await page.locator('.act-form input[aria-label="Reviewer name"]').fill("Priya Shah");
+  await page.locator('.act-form input[aria-label="Justification"]').fill("Called Bluepeak on (408) 555-0123 from the vendor master; finance confirmed the account");
+  await page.locator(".act-form .verify input").check();
+  await page.locator(".act-form .btn", { hasText: "Confirm" }).click();
+  await page.waitForTimeout(1300);
+  const pay = await page.locator(".ctl-payment, .ctl li").filter({ hasText: "Payment details" }).innerText();
+  const foot1 = await page.locator(".ctl-foot").innerText();
+  check(/Resolved/.test(pay) && /1 unresolved control/.test(foot1) && (await page.locator(".act", { hasText: /^Approve/ }).isDisabled()), `After bank verification: payment control resolved, "${foot1.trim()}", approve still locked`);
+  await shot("bluepeak-checklist-after-bank");
+  await page.locator(".ctl .btn", { hasText: "Resolve PO discrepancy" }).click();
+  await page.locator('.act-form input[aria-label="Reviewer name"]').fill("Priya Shah");
+  await page.locator('.act-form input[aria-label="Justification"]').fill("Surcharge BP-PRICE-2026-Q2 accepted by the PO owner");
+  await page.locator('.act-form input[aria-label="Authorised by"]').fill("a.patel");
+  await page.locator('.act-form input[aria-label="Amendment reference"]').fill("PO-2026-0184-A1");
+  await page.locator(".act-form .btn", { hasText: "Confirm" }).click();
+  await page.waitForTimeout(1300);
+  const foot2 = await page.locator(".ctl-foot").innerText();
+  check(/All controls satisfied/.test(foot2) && !(await page.locator(".act", { hasText: /^Approve/ }).isDisabled()), `After PO authorisation: "${foot2.trim()}", approve unlocked`);
+}
+
+// ---- 5c) Document-to-data verification ----
+const acme = (await runs()).find((r) => r.invoice.invoiceNumber === "INV-1047" && !r.repeatSubmission);
+await page.goto(`${base}/invoice/${acme.id}?from=history`);
+await page.locator(".seg button", { hasText: "Detailed" }).click();
+await page.locator(".fv", { hasText: "Total" }).first().click();
+await page.waitForTimeout(600);
+check((await page.locator(".hl-box").count()) >= 1, `Digital PDF: clicking Total highlights it on the page (${await page.locator(".hl-box").count()} box)`);
+await shot("locate-digital");
+const raoRun = (await runs()).find((r) => /rao/i.test(r.invoice.vendor));
+await page.goto(`${base}/invoice/${raoRun.id}?from=history`);
+await page.locator(".fv", { hasText: "Total" }).first().click();
+check(await page.locator(".doc-hl-none").isVisible(), "Handwritten photo: no fabricated box; explains there is no text layer");
+await page.locator(".seg button", { hasText: "Summary" }).click();
+
+// ---- 5d) History: duplicate attempts are not mistaken for rejected invoices ----
+await page.goto(`${base}/history`);
+await page.waitForTimeout(700);
+const dupCount = await page.locator(".badge.st-dup").count();
+check(dupCount >= 2, `History marks ${dupCount} repeat attempts as "Duplicate blocked" with a link to the original`);
+
 // ---- 6) Persistence + metrics ----
-await page.reload();
+await page.goto(`${base}/invoice/${rao.id}?from=history`);
 await page.locator(".audit").waitFor();
 const auditText = await page.locator(".audit").innerText();
 check(/Confirmed extracted information/.test(auditText) && /demo identity/.test(auditText), "Audit timeline persists after reload and labels the demo identity");

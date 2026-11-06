@@ -1,5 +1,7 @@
 import { useMemo, useState } from "react";
-import { ArrowRight, FileText, Search } from "lucide-react";
+import { ArrowRight, Ban, FileText, Search } from "lucide-react";
+import { attemptKind } from "./lib/controls";
+import { statusLabel } from "./lib/engine";
 import { ACTION_GROUPS, REASON_LABEL, SHORT, requiredAction } from "./copy";
 import { money } from "./lib/engine";
 import { openCases } from "./lib/analytics";
@@ -63,6 +65,35 @@ export function AttentionRow({ r, onOpen, selected, compact }: { r: QueueItem; o
   );
 }
 
+// An attempt's outcome, worded so a blocked duplicate upload is never read as
+// "the invoice was rejected". Links to the original case.
+function AttemptStatus({ r, runs }: { r: RunRecord; runs: RunRecord[] }) {
+  const k = attemptKind(r);
+  if (k === "original") return <StatusBadge status={r.status} />;
+  const orig = r.duplicateOf?.runId ? runs.find((x) => x.id === r.duplicateOf!.runId) : undefined;
+  return (
+    <div className="att">
+      <span className="badge st-dup">
+        <Ban size={13} aria-hidden /> Duplicate blocked
+      </span>
+      <span className="sub">
+        {k === "duplicate_of_paid" ? (
+          <>Already paid as {r.duplicateOf!.invoiceNumber}</>
+        ) : orig ? (
+          <a
+            href={`/invoice/${orig.id}?from=history`}
+            onClick={(e) => e.stopPropagation()}
+          >
+            Original: {statusLabel(orig.status).toLowerCase()} →
+          </a>
+        ) : (
+          <>Original on file</>
+        )}
+      </span>
+    </div>
+  );
+}
+
 type Filter = "all" | CaseStatus;
 
 export function RunsTable({ runs, loaded, from, limit }: { runs: RunRecord[]; loaded: boolean; from: string; limit?: number }) {
@@ -121,15 +152,12 @@ export function RunsTable({ runs, loaded, from, limit }: { runs: RunRecord[]; lo
             <tbody>
               {list.map((r) => (
                 <tr key={r.id} tabIndex={0} onClick={() => go(r.id, from)} onKeyDown={(e) => e.key === "Enter" && go(r.id, from)}>
-                  <td className="strong">
-                    {r.vendorMatched ?? r.invoice.vendor}
-                    {r.repeatSubmission && <span className="sub">Repeat submission</span>}
-                  </td>
+                  <td className="strong">{r.vendorMatched ?? r.invoice.vendor}</td>
                   <td className="mono">{r.invoice.invoiceNumber ?? "—"}</td>
                   <td className="num strong">{money(r.invoice.total, r.invoice.currency)}</td>
                   <td className="muted tabnum">{fmtDate(r.createdAt)}</td>
                   <td>
-                    <StatusBadge status={r.status} />
+                    <AttemptStatus r={r} runs={runs} />
                   </td>
                   <td className="num muted">{fmtSecs(r.durationMs)}</td>
                   <td className="num">

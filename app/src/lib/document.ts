@@ -4,6 +4,7 @@
 
 import * as pdfjs from "pdfjs-dist";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+import type { TextBox } from "../types";
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 
@@ -17,6 +18,7 @@ export interface PreparedDocument {
   textLayer: string;
   hasTextLayer: boolean;
   pageCount: number;
+  textBoxes?: TextBox[]; // page-1 text positions (digital PDFs only)
 }
 
 function readAsDataUrl(file: Blob): Promise<string> {
@@ -54,6 +56,7 @@ export async function prepareDocument(file: File): Promise<PreparedDocument> {
   const pages = Math.min(pdf.numPages, MAX_PAGES);
   const images: string[] = [];
   const texts: string[] = [];
+  const textBoxes: TextBox[] = [];
   for (let i = 1; i <= pages; i++) {
     const page = await pdf.getPage(i);
     const content = await page.getTextContent();
@@ -64,6 +67,22 @@ export async function prepareDocument(file: File): Promise<PreparedDocument> {
         .trim(),
     );
     const viewport = page.getViewport({ scale: 1.6 });
+    if (i === 1) {
+      // Real positions of each text run on page 1, as fractions of the page,
+      // so the viewer can point at the exact source of an extracted value.
+      for (const it of content.items) {
+        if (!("str" in it) || !it.str.trim()) continue;
+        const t = pdfjs.Util.transform(viewport.transform, it.transform);
+        const fontH = Math.hypot(t[2], t[3]);
+        textBoxes.push({
+          s: it.str,
+          x: t[4] / viewport.width,
+          y: (t[5] - fontH) / viewport.height,
+          w: (it.width * viewport.scale) / viewport.width,
+          h: (fontH * 1.15) / viewport.height,
+        });
+      }
+    }
     const canvas = document.createElement("canvas");
     canvas.width = Math.ceil(viewport.width);
     canvas.height = Math.ceil(viewport.height);
@@ -79,5 +98,6 @@ export async function prepareDocument(file: File): Promise<PreparedDocument> {
     textLayer,
     hasTextLayer: textLayer.replace(/\s/g, "").length > 40,
     pageCount: pdf.numPages,
+    textBoxes,
   };
 }

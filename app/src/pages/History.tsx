@@ -1,5 +1,5 @@
 import { RotateCcw } from "lucide-react";
-import { openCases } from "../lib/analytics";
+import { computeMetrics, openCases } from "../lib/analytics";
 import { resetRuns } from "../lib/runsApi";
 import { Shell } from "../Shell";
 import { RunsTable } from "../tables";
@@ -13,7 +13,12 @@ export default function History() {
       <header className="page-head">
         <div>
           <h1 className="h1">Invoice history</h1>
-          <p className="sub">Every submission and its decision. Open one to see the evidence and audit trail.</p>
+          <p className="sub">
+            {(() => {
+              const m = computeMetrics(runs);
+              return `${m.attempts} processing attempt${m.attempts === 1 ? "" : "s"} for ${m.cases} unique invoice${m.cases === 1 ? "" : "s"}${m.repeatAttempts ? ` · ${m.repeatAttempts} ${m.repeatAttempts === 1 ? "was a repeat upload" : "were repeat uploads"} of an invoice already processed here, so no extra payable was created` : ""}.`;
+            })()}
+          </p>
         </div>
         <button
           className="btn"

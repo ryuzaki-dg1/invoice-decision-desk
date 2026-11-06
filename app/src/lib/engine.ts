@@ -257,15 +257,24 @@ export function checkVendor(inv: Invoice, vendors: Vendor[]): { vendor: Vendor |
   if (v.status === "blocked") {
     findings.push(finding("vendor", "VENDOR_BLOCKED", "reject", "Vendor is blocked", `${v.name} is blocked in the vendor master.`));
   }
-  if (inv.bankAccount) {
-    if (digitsOnly(inv.bankAccount) !== digitsOnly(v.bankAccount)) {
+  // Invoices often print only the last digits ("Acct ending 4821"). A partial
+  // number matches if it is the tail of the account on file; it is only a
+  // mismatch when the printed digits disagree with the account on file.
+  const invDigits = digitsOnly(inv.bankAccount);
+  const masterDigits = digitsOnly(v.bankAccount);
+  const partial = invDigits.length >= 4 && invDigits.length < masterDigits.length;
+  const bankMatches = partial ? masterDigits.endsWith(invDigits) : invDigits === masterDigits;
+  if (inv.bankAccount && invDigits.length < 4) {
+    lines.push("Bank details too short to compare; payment would go to the account on file");
+  } else if (inv.bankAccount) {
+    if (!bankMatches) {
       findings.push(
         finding(
           "vendor",
           "BANK_ACCOUNT_MISMATCH",
           "escalate",
           "Bank account differs from approved vendor records",
-          `The invoice asks for payment to an account that is not on file for ${v.name}. Changed bank details on an invoice are the most common payment-fraud pattern. Verify the change by calling the vendor on the number already in the vendor master, never a number from the invoice or email.`,
+          `The invoice asks for payment to an account that is not on file for ${v.name}. Changed bank details are a common route for payment fraud, so the change must be verified independently by calling the vendor on the number already in the vendor master, never a number from the invoice or email.`,
           [
             { label: "Approved account (vendor master)", value: `${maskAccount(v.bankAccount)} · ${v.bankName}`, tone: "good" },
             { label: "Account on invoice", value: maskAccount(inv.bankAccount), tone: "bad" },
@@ -275,7 +284,7 @@ export function checkVendor(inv: Invoice, vendors: Vendor[]): { vendor: Vendor |
       );
       lines.push(`Invoice account ${maskAccount(inv.bankAccount)} ≠ approved ${maskAccount(v.bankAccount)}`);
     } else {
-      lines.push(`Bank account matches vendor master (${maskAccount(v.bankAccount)})`);
+      lines.push(`Bank account matches vendor master (${maskAccount(v.bankAccount)})${partial ? ` · only the last ${invDigits.length} digits are printed` : ""}`);
     }
   } else {
     lines.push("No bank details printed; payment would go to the account on file");
@@ -328,6 +337,7 @@ function billingFor(po: PurchaseOrder, inv: Invoice, vendorId: string | null, le
     priorInvoices: prior.map((p) => p.invoiceNumber),
     pendingOnPo: round2(pending.reduce((s, l) => s + l.total, 0)),
     pendingInvoices: pending.map((p) => p.invoiceNumber),
+    ledger: [...prior, ...pending].map((l) => ({ invoiceNumber: l.invoiceNumber, issueDate: l.issueDate, total: l.total, status: l.status, source: l.source, confirmed: isConfirmed(l) })),
   };
 }
 

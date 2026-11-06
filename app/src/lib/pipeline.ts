@@ -218,6 +218,7 @@ export async function runPipeline(doc: PreparedDocument, ctx: PipelineContext, c
     status,
     resolvedCodes: [],
     hasPreview: false,
+    textBoxes: doc.hasTextLayer ? doc.textBoxes : undefined,
     repeatSubmission: dup.repeat,
     rules: { ...ctx.rules },
     duplicateOf: dup.duplicateOf,

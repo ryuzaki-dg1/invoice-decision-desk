@@ -10,6 +10,8 @@ import { buildLedger, checkDuplicates, checkVendor, decide, fmtPct, initialStatu
 import { applyReviewAction, availableActions } from "../review.ts";
 import { applyCorrections } from "../revalidate.ts";
 import { buildCases, computeMetrics } from "../analytics.ts";
+import { attemptKind, deriveControls, invoiceChecks, paymentReadiness } from "../controls.ts";
+import { locate } from "../locate.ts";
 import { runPipeline } from "../pipeline.ts";
 import { DEFAULT_RULES } from "../policy.ts";
 
@@ -267,6 +269,12 @@ test("05 bank change: payment hold with masked accounts", () => {
   assert.doesNotMatch(ev, /441022874821/);
 });
 
+test("bank: a partially printed account ('ending 4821') matches the tail of the account on file", () => {
+  assert.ok(!run({ ...HAPPY, invoiceNumber: "INV-2001", bankAccount: "4821" }).codes.includes("BANK_ACCOUNT_MISMATCH"), "Acme master ends 4821 → no mismatch");
+  assert.ok(run({ ...HAPPY, invoiceNumber: "INV-2002", bankAccount: "9934" }).codes.includes("BANK_ACCOUNT_MISMATCH"), "different last digits → mismatch");
+  assert.ok(run({ ...BLUEPEAK, bankAccount: "4821" }).codes.includes("BANK_ACCOUNT_MISMATCH"), "Bluepeak master ends 1147, invoice says 4821");
+});
+
 test("06 unknown vendor with no PO is a payment hold", () => {
   const r = run(inv({ vendor: "Brightline Supply Co", invoiceNumber: "BL-2291", lineItems: [{ description: "Consulting services", quantity: 1, unitPrice: 4800, total: 4800 }], subtotal: 4800, total: 4800 }));
   assert.equal(r.decision.resolution, "ESCALATE");
@@ -439,6 +447,96 @@ test("closed cases reject further actions (idempotent close)", () => {
   const rej = applyReviewAction(r, { action: "reject", reviewer: "Priya", justification: "Confirmed fraud attempt" });
   assert.ok(rej.ok);
   if (rej.ok) assert.equal(applyReviewAction(rej.run, { action: "reject", reviewer: "Priya", justification: "again" }).ok, false);
+});
+
+// ---------- Control checklist & readiness ----------
+
+test("checklist: bank + PO overage → verify bank resolves only the bank control; approve stays locked", () => {
+  const r0 = asRun(BLUEPEAK, run(BLUEPEAK), "c1");
+  const c0 = deriveControls(r0);
+  const st = (c: ReturnType<typeof deriveControls>, k: string) => c.find((x) => x.key === k)?.status;
+  assert.equal(st(c0, "document"), "passed");
+  assert.equal(st(c0, "payment"), "unresolved");
+  assert.equal(st(c0, "po"), "unresolved");
+  assert.equal(c0.find((x) => x.key === "payment")?.action?.id, "verify_bank");
+  assert.equal(c0.find((x) => x.key === "po")?.action?.id, "resolve_po");
+  assert.equal(invoiceChecks(r0), "Exceptions found");
+  assert.equal(paymentReadiness(r0).label, "Blocked");
+  const v = applyReviewAction(r0, { action: "verify_bank", reviewer: "P", justification: "called on file", verificationConfirmed: true });
+  assert.ok(v.ok);
+  if (!v.ok) return;
+  const c1 = deriveControls(v.run);
+  assert.equal(st(c1, "payment"), "resolved");
+  assert.match(c1.find((x) => x.key === "payment")!.resolvedBy!, /P$/);
+  assert.equal(st(c1, "po"), "unresolved", "PO control untouched");
+  assert.equal(availableActions(v.run).find((a) => a.id === "approve")?.allowed, false);
+});
+
+test("readiness: a valid invoice with only a bank change is 'awaiting verification', not invoice-invalid", () => {
+  const r = asRun(BANK_CHANGE, run(BANK_CHANGE), "c2");
+  assert.equal(invoiceChecks(r), "Passed");
+  assert.equal(paymentReadiness(r).label, "Awaiting verification");
+  const ok = asRun(HAPPY, run(HAPPY), "c3");
+  assert.equal(paymentReadiness(ok).label, "Ready");
+  assert.match(paymentReadiness(ok).detail, /not yet paid/);
+});
+
+test("duplicate upload of an invoice still ON HOLD: blocked as a duplicate, original stays open", () => {
+  const orig = asRun(BANK_CHANGE, run(BANK_CHANGE), "h1");
+  const ledger = buildLedger(ERP_LEDGER, [orig]);
+  const again = run(BANK_CHANGE, ledger, "h1", [{ runId: "h1", fileHash: "h1", createdAt: 0, status: "payment_hold", invoiceNumber: "INV-1052" }]);
+  assert.equal(again.decision.resolution, "REJECT");
+  assert.equal(again.dup.duplicateOf?.status, "in_review");
+  assert.match(again.decision.nextAction, /under review/);
+  const dupRun = { ...asRun(BANK_CHANGE, again, "h2"), repeatSubmission: true, duplicateOf: again.dup.duplicateOf };
+  assert.equal(attemptKind(dupRun), "duplicate_submission");
+  const cases = buildCases([orig, dupRun]);
+  assert.equal(cases.length, 1);
+  assert.equal(cases[0].status, "payment_hold", "rejecting the duplicate does not close the original");
+  assert.equal(computeMetrics([orig, dupRun]).awaiting, 1);
+});
+
+test("re-upload under a vendor alias is still caught as the same invoice", () => {
+  const first = asRun(HAPPY, run(HAPPY), "al1");
+  const ledger = buildLedger(ERP_LEDGER, [first]);
+  const alias = run({ ...HAPPY, vendor: "Acme Industrial", invoiceNumber: "Invoice No. 1047" }, ledger, "other-file");
+  assert.equal(alias.decision.resolution, "REJECT");
+  assert.equal(alias.dup.duplicateOf?.invoiceNumber, "INV-1047");
+});
+
+test("repeat uploads never consume PO balance twice", () => {
+  const sr = (n: string, qty: number) =>
+    inv({ vendor: "Sunridge Chemicals Ltd.", invoiceNumber: n, poReference: "PO-2026-0211", lineItems: [{ description: "Industrial solvent XR-4 (drum, 55gal)", quantity: qty, unitPrice: 295, total: 295 * qty }], subtotal: 295 * qty, tax: 23.6 * qty, total: 318.6 * qty });
+  const a = sr("SC-3380", 4);
+  const ra = asRun(a, run(a), "p1"); // approved partial (12 + 4 = 16 of 20 drums)
+  assert.equal(ra.status, "approved");
+  const dupR = run(a, buildLedger(ERP_LEDGER, [ra]), "p1", [{ runId: "p1", fileHash: "p1", createdAt: 0, status: "approved", invoiceNumber: "SC-3380" }]);
+  const rdup = { ...asRun(a, dupR, "p2"), repeatSubmission: true };
+  assert.equal(rdup.status, "rejected");
+  const b = sr("SC-3381", 4); // 12 + 4 + 4 = 20 drums: exactly the PO if the duplicate isn't counted
+  const rb = run(b, buildLedger(ERP_LEDGER, [ra, rdup]));
+  assert.equal(rb.poMatch.billing?.previouslyBilled, 3823.2 + 1274.4);
+  assert.ok(!rb.blocking.includes("QUANTITY_EXCEEDS_PO"));
+  assert.equal(rb.poMatch.billing?.ledger?.length, 2, "ledger shows each earlier invoice once");
+});
+
+// ---------- Document-to-data locator ----------
+
+test("locate: finds real text positions and never guesses", () => {
+  const boxes = [
+    { s: "INV-1047", x: 0.7, y: 0.1, w: 0.1, h: 0.02 },
+    { s: "2026-11-02", x: 0.7, y: 0.12, w: 0.1, h: 0.02 },
+    { s: "$1,379.65", x: 0.8, y: 0.5, w: 0.1, h: 0.02 },
+    { s: "$2,950.00", x: 0.8, y: 0.4, w: 0.1, h: 0.02 },
+    { s: "First Midwest Bank · Account 4410 2287 4821 · Routing 071000013", x: 0.1, y: 0.7, w: 0.6, h: 0.02 },
+  ];
+  assert.equal(locate(boxes, "money", 1379.65).length, 1);
+  assert.equal(locate(boxes, "money", 50).length, 0, "50.00 must not match inside 2,950.00");
+  assert.equal(locate(boxes, "text", "INV-1047")[0].y, 0.1);
+  assert.equal(locate(boxes, "date", "2026-11-02").length, 1);
+  assert.equal(locate(boxes, "digits", "441022874821").length, 1);
+  assert.equal(locate(undefined, "money", 1379.65).length, 0, "no text layer (scan/photo) → no boxes");
+  assert.equal(locate(boxes, "money", 999.99).length, 0);
 });
 
 // ---------- Analytics ----------

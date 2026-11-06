@@ -30,6 +30,24 @@ Key rules:
 - **Duplicates:** conservative invoice-number normalisation (case, spaces, punctuation, a leading "INV"/"Invoice No" label, leading zeros), scoped to the same vendor. Same amount with a different number is only a *possible* duplicate. A byte-identical re-upload is recorded as a repeat submission and never adds a payable.
 - **Approved ≠ paid:** "paid" is only said when the ERP history has a payment record (seeded demo data). Invoices approved here are "approved for payment, not yet paid".
 
+## Understand → Control → Resolve
+
+- **Understand:** AI reads digital PDFs, scans and handwritten photos into structured fields. Uncertain values are flagged as a review signal, not a score.
+- **Control:** deterministic rules check arithmetic, vendor identity, payment details, PO value/quantity/price (cumulative), duplicates and policy limits.
+- **Resolve:** each invoice shows **"Before this invoice can be approved"**, a checklist derived from the findings (`src/lib/controls.ts`), not written per scenario. Each control shows Passed / Unresolved / Resolved / Not applicable with a one-line reason, a link to its evidence and the action that resolves it. The footer reads e.g. "2 unresolved controls · Payment approval locked". Resolving one control never resolves another; approval is a separate, explicit step.
+- **Invoice checks vs payment readiness:** an invoice can be valid (arithmetic and PO pass) and still unsafe to pay (changed bank account). Two derived indicators show this:
+  - Invoice checks: Passed / Exceptions found / Incomplete
+  - Payment readiness: Ready / Awaiting verification / Awaiting approval / Blocked / Closed
+
+  "Ready" means approved for the payment run, never "paid".
+- **Document-to-data verification:** for digital PDFs, the app stores the real page-1 positions of every text run from the PDF text layer. Clicking an extracted value (vendor, invoice no., date, PO, account, subtotal, tax, freight, total, line amounts) highlights it on the original. Scans and photos have no text layer, so the app says so instead of drawing a guessed box.
+- **PO utilisation:** a stacked bar and a figure row, all computed from the stored ledger:
+  - Stacked bar: billed before (confirmed) | this invoice within the PO | over the PO, with the tolerance band shown separately.
+  - Figure row: authorised value, billed before, this invoice, cumulative, remaining or over, tolerance.
+  - Quantity table: ordered, billed before, this invoice, total, excess.
+  - Expandable ledger: every earlier invoice on the PO, each counted once. Pending invoices are shown but not counted; rejected duplicates are excluded.
+- **Duplicate semantics:** a re-upload is shown as **"Duplicate blocked"**, never as a rejected invoice. The decision screen links to the original case and its current status, which is unaffected.
+
 ## Metrics (one shared analytics layer: `src/lib/analytics.ts`)
 
 - **Processing attempts:** every pipeline run, including repeat uploads.
@@ -105,7 +123,7 @@ npm run dev            # http://localhost:5173
 
 ## Testing
 
-- `npm test` runs 29 tests on the decision engine, review rules, correction loop, analytics and AI-failure handling: every scenario plus arithmetic, discounts, approved-vs-paid wording, repeat uploads, possible duplicates and reviewer controls. No API calls are made.
+- `npm test` runs 36 tests: decision engine, multi-finding review rules, correction loop, analytics, control checklist, duplicate semantics, PO accounting, the locator and AI-failure handling: every scenario plus arithmetic, discounts, approved-vs-paid wording, repeat uploads, possible duplicates and reviewer controls. No API calls are made.
 - `node scripts/e2e.mjs` drives the real UI in Edge through all six invoices with the live model, then a repeat upload and the bank-verification review flow, and saves screenshots. It clears run history first. `--ui-only` reuses stored runs to save model quota.
 
 ## Deploy

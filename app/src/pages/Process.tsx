@@ -307,20 +307,20 @@ export default function Process() {
             <div className="demo-grid">
               {SAMPLES.map((s) => {
                 const I = KIND_ICON[s.kind];
-                const [vendor, ref] = s.title.split(" · ");
+                const [vendor] = s.title.split(" · ");
                 return (
-                  <button key={s.file} className={`demo ${activeSample === s.file ? "on" : ""}`} onClick={() => loadSample(s)} disabled={preparing || running}>
+                  <button key={s.file} className={`demo ${activeSample === s.file ? "on" : ""}`} onClick={() => loadSample(s)} disabled={preparing || running} title={`${s.title}: ${s.scenario}`}>
                     <span className={`demo-icon k-${s.kind.split(" ")[0].toLowerCase()}`}>
                       <I size={18} />
                     </span>
                     <span className="demo-body">
-                      <span className="demo-vendor">{vendor}</span>
+                      <span className="demo-vendor">{s.short}</span>
                       <span className="demo-kind">
-                        {s.kind} · {ref}
+                        {s.kind} · {vendor}
                       </span>
-                      <span className="demo-desc">{s.scenario}</span>
+                      <span className="demo-desc demo-desc-1">{s.complication}</span>
                       <span className="demo-exp">
-                        <span className="muted">Demo expectation</span> <StatusBadge status={resolutionToStatus(s.expect)} />
+                        <span className="muted">Expected</span> <StatusBadge status={resolutionToStatus(s.expect)} />
                       </span>
                     </span>
                   </button>

@@ -2,9 +2,11 @@
 // evidence and guided resolution on the right (60%). The queue uses the same
 // workspace without the document pane (document opens in a viewer instead).
 
-import { useMemo, useState, type ReactNode } from "react";
-import { Ban, BadgeCheck, Check, ClipboardCheck, ExternalLink, FileSearch, History, Landmark, MessageSquareText, PauseCircle, PencilLine, ShieldCheck, ZoomIn, ZoomOut } from "lucide-react";
-import { ACTION_GROUPS, REASON_LABEL, SHORT, nextStep, requiredAction } from "./copy";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { ArrowRight, Ban, BadgeCheck, Check, CircleDashed, ClipboardCheck, ExternalLink, FileSearch, History, Landmark, Lock, MapPin, MessageSquareText, PauseCircle, PencilLine, ShieldCheck, TriangleAlert, X, ZoomIn, ZoomOut } from "lucide-react";
+import { attemptKind, deriveControls, invoiceChecks, paymentReadiness, PASS_TEXT, type ControlAction } from "./lib/controls";
+import { locate, type LocateKind } from "./lib/locate";
+import { REASON_LABEL, SHORT, nextStep, requiredAction } from "./copy";
 import { PURCHASE_ORDERS } from "./data/purchaseOrders";
 import { ERP_LEDGER, VENDORS } from "./data/vendors";
 import { EvidenceStack } from "./evidence";
@@ -13,15 +15,43 @@ import { DEFAULT_RULES } from "./lib/rules";
 import { NEEDS_CORRECTION, availableActions, openCodes, type ActionOption, type ReviewActionId } from "./lib/review";
 import { submitCorrection, submitReview } from "./lib/runsApi";
 import { AuditTrail, Findings, Timeline, VendorComms, decidedBy } from "./runView";
-import type { Invoice, RunRecord, StageId } from "./types";
-import { Attribution, Modal, SEVERITY, StatusBadge, fmtDate, fmtSecs, useDensity, useReviewer } from "./ui";
+import type { Invoice, RunRecord, TextBox } from "./types";
+import { Attribution, Modal, StatusBadge, fmtDate, fmtSecs, useDensity, useReviewer } from "./ui";
 
 // ---------------- Document viewer ----------------
 
-export function DocumentViewer({ src, href, title, meta, sticky = true }: { src: string | null; href?: string; title: string; meta: string; sticky?: boolean }) {
+export interface Highlight {
+  label: string;
+  boxes: TextBox[];
+  note?: string; // shown when the value can't be located
+}
+
+export function DocumentViewer({ src, href, title, meta, sticky = true, highlight, onClearHighlight }: { src: string | null; href?: string; title: string; meta: string; sticky?: boolean; highlight?: Highlight | null; onClearHighlight?: () => void }) {
   const [zoom, setZoom] = useState(100);
+  const firstBox = useRef<HTMLSpanElement>(null);
+  useEffect(() => {
+    firstBox.current?.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
+  }, [highlight, zoom]);
   return (
     <section className={`doc ${sticky ? "doc-sticky" : ""}`} aria-label="Original invoice">
+      {highlight && (
+        <div className={`doc-hl ${highlight.boxes.length ? "" : "doc-hl-none"}`} role="status">
+          {highlight.boxes.length ? (
+            <>
+              <MapPin size={14} /> Showing <b>{highlight.label}</b> on the page{highlight.boxes.length > 1 ? ` · ${highlight.boxes.length} matches` : ""}
+            </>
+          ) : (
+            <>
+              <MapPin size={14} /> {highlight.note ?? `Couldn't locate “${highlight.label}” in the document's text. Compare visually.`}
+            </>
+          )}
+          {onClearHighlight && (
+            <button className="icon-btn" aria-label="Clear highlight" onClick={onClearHighlight}>
+              <X size={14} />
+            </button>
+          )}
+        </div>
+      )}
       <div className="doc-bar">
         <div className="doc-name" title={title}>
           <b>{title}</b>
@@ -42,9 +72,34 @@ export function DocumentViewer({ src, href, title, meta, sticky = true }: { src:
           )}
         </div>
       </div>
-      <div className="doc-view">{src ? <img src={src} alt={`Page 1 of ${title}`} style={{ width: `${zoom}%` }} /> : <p className="muted small">No page image stored for this run.</p>}</div>
+      <div className="doc-view">
+        {src ? (
+          <div className="doc-page" style={{ width: `${zoom}%` }}>
+            <img src={src} alt={`Page 1 of ${title}`} />
+            {highlight?.boxes.map((b, i) => (
+              <span
+                key={i}
+                ref={i === 0 ? firstBox : undefined}
+                className="hl-box"
+                style={{ left: `${b.x * 100 - 0.4}%`, top: `${b.y * 100 - 0.3}%`, width: `${b.w * 100 + 0.8}%`, height: `${b.h * 100 + 0.6}%` }}
+                title={b.s}
+              />
+            ))}
+          </div>
+        ) : (
+          <p className="muted small">No page image stored for this run.</p>
+        )}
+      </div>
     </section>
   );
+}
+
+// Builds a highlight from the run's stored text positions (digital PDFs only).
+export function locateField(run: RunRecord, label: string, kind: LocateKind, value: string | number | null | undefined): Highlight {
+  if (!run.textBoxes?.length) {
+    return { label, boxes: [], note: `This ${run.invoice.documentType} document has no text layer, so exact positions aren't available. Compare “${label}” against the page.` };
+  }
+  return { label, boxes: locate(run.textBoxes, kind, value) };
 }
 
 // ---------------- Fields: review + correction ----------------
@@ -63,7 +118,25 @@ const toDraft = (inv: Invoice): Draft => ({
   lines: inv.lineItems.map((l) => ({ quantity: s(l.quantity), unitPrice: s(l.unitPrice), total: s(l.total) })),
 });
 
-function FieldsPanel({ run, editing, setEditing, patch, onSaved, onError }: { run: RunRecord; editing: boolean; setEditing: (b: boolean) => void; patch?: Partial<Draft> | null; onSaved: (r: RunRecord) => void; onError: (m: string) => void }) {
+function FieldsPanel({
+  run,
+  editing,
+  setEditing,
+  patch,
+  onSaved,
+  onError,
+  onLocate,
+  selected,
+}: {
+  run: RunRecord;
+  editing: boolean;
+  setEditing: (b: boolean) => void;
+  patch?: Partial<Draft> | null;
+  onSaved: (r: RunRecord) => void;
+  onError: (m: string) => void;
+  onLocate?: (field: string, label: string, kind: LocateKind, value: string | number | null) => void;
+  selected?: string | null;
+}) {
   const inv = run.invoice;
   const c = inv.currency;
   const [reviewer, setReviewer] = useReviewer();
@@ -91,12 +164,22 @@ function FieldsPanel({ run, editing, setEditing, patch, onSaved, onError }: { ru
     if (unconfirmed) return ["fv-unconf", "Unconfirmed"];
     return [""];
   };
-  const Cell = ({ field, label, value, shown, bad }: { field: string; label: string; value: unknown; shown?: ReactNode; bad?: boolean }) => {
+  const Cell = ({ field, label, value, shown, bad, kind }: { field: string; label: string; value: unknown; shown?: ReactNode; bad?: boolean; kind?: LocateKind }) => {
     const [cls, tag] = state(field, value, bad);
+    const can = !!onLocate && kind && value !== null && value !== undefined && value !== "";
+    const go = () => can && onLocate!(field, label, kind!, value as string | number);
     return (
-      <div className={`fv ${cls}`}>
+      <div
+        className={`fv ${cls} ${can ? "fv-loc" : ""} ${selected === field ? "fv-sel" : ""}`}
+        role={can ? "button" : undefined}
+        tabIndex={can ? 0 : undefined}
+        title={can ? "Show where this appears in the document" : undefined}
+        onClick={go}
+        onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), go())}
+      >
         <span className="fv-k">
           {label} {tag && <em>{tag}</em>}
+          {can && <MapPin size={12} className="fv-pin" aria-hidden />}
         </span>
         <span className="fv-v">{shown ?? (value === null || value === undefined || value === "" ? "—" : String(value))}</span>
       </div>
@@ -154,13 +237,17 @@ function FieldsPanel({ run, editing, setEditing, patch, onSaved, onError }: { ru
       </div>
       {!editing ? (
         <>
+          {onLocate && <p className="muted small" style={{ margin: "0 0 8px" }}>Click a value to see where it appears in the original.</p>}
           <div className="fgrid">
-            <Cell field="invoiceNumber" label="Invoice no." value={inv.invoiceNumber} />
-            <Cell field="issueDate" label="Date" value={inv.issueDate} />
-            <Cell field="poReference" label="PO reference" value={inv.poReference ?? ""} shown={inv.poReference ?? <span className="muted">Not printed</span>} />
-            <Cell field="subtotal" label="Subtotal" value={inv.subtotal} shown={money(inv.subtotal, c)} />
-            <Cell field="tax" label="Tax" value={inv.tax} shown={money(inv.tax, c)} />
-            <Cell field="total" label="Total" value={inv.total} shown={money(inv.total, c)} bad={totalOff} />
+            <Cell field="vendor" label="Vendor" value={inv.vendor} kind="vendor" />
+            <Cell field="invoiceNumber" label="Invoice no." value={inv.invoiceNumber} kind="text" />
+            <Cell field="issueDate" label="Date" value={inv.issueDate} kind="date" />
+            <Cell field="poReference" label="PO reference" value={inv.poReference ?? ""} shown={inv.poReference ?? <span className="muted">Not printed</span>} kind="text" />
+            <Cell field="bankAccount" label="Remit-to account" value={inv.bankAccount ?? ""} shown={inv.bankAccount ? `•••• ${inv.bankAccount.replace(/\D/g, "").slice(-4)}` : <span className="muted">Not printed</span>} kind="digits" />
+            <Cell field="subtotal" label="Subtotal" value={inv.subtotal} shown={money(inv.subtotal, c)} kind="money" />
+            <Cell field="tax" label="Tax" value={inv.tax} shown={money(inv.tax, c)} kind="money" />
+            <Cell field="shipping" label="Freight" value={inv.shipping} shown={money(inv.shipping, c)} kind={inv.shipping ? "money" : undefined} />
+            <Cell field="total" label="Total" value={inv.total} shown={money(inv.total, c)} bad={totalOff} kind="money" />
           </div>
           <table className="tbl tbl-sm" style={{ marginTop: 12 }}>
             <thead>
@@ -175,12 +262,26 @@ function FieldsPanel({ run, editing, setEditing, patch, onSaved, onError }: { ru
               {inv.lineItems.map((l, i) => {
                 const off = Math.abs(l.quantity * l.unitPrice - l.total) > 1;
                 const cls = (f: "quantity" | "unitPrice" | "total") => state(`lineItems[${i}].${f}`, l[f], off && f === "total")[0];
+                const loc = (f: "unitPrice" | "total") =>
+                  onLocate
+                    ? {
+                        role: "button" as const,
+                        tabIndex: 0,
+                        title: "Show where this appears in the document",
+                        onClick: () => onLocate(`lineItems[${i}].${f}`, `${l.description} ${f === "total" ? "amount" : "unit price"}`, "money", l[f]),
+                        onKeyDown: (e: React.KeyboardEvent) => e.key === "Enter" && onLocate(`lineItems[${i}].${f}`, `${l.description} ${f === "total" ? "amount" : "unit price"}`, "money", l[f]),
+                      }
+                    : {};
                 return (
                   <tr key={i}>
                     <td>{l.description}</td>
                     <td className={`num ${cls("quantity")}`}>{l.quantity}</td>
-                    <td className={`num ${cls("unitPrice")}`}>{money(l.unitPrice, c)}</td>
-                    <td className={`num ${cls("total")}`}>{money(l.total, c)}</td>
+                    <td className={`num ${cls("unitPrice")} ${onLocate ? "td-loc" : ""} ${selected === `lineItems[${i}].unitPrice` ? "td-sel" : ""}`} {...loc("unitPrice")}>
+                      {money(l.unitPrice, c)}
+                    </td>
+                    <td className={`num ${cls("total")} ${onLocate ? "td-loc" : ""} ${selected === `lineItems[${i}].total` ? "td-sel" : ""}`} {...loc("total")}>
+                      {money(l.total, c)}
+                    </td>
                   </tr>
                 );
               })}
@@ -336,9 +437,27 @@ const ACTION_META: Record<ReviewActionId, { icon: typeof Check; help: string }> 
   reject: { icon: Ban, help: "Reject the submission. No payable is created and the case closes." },
 };
 
-function GuidedActions({ run, onUpdated, onError, onCorrect }: { run: RunRecord; onUpdated: (r: RunRecord, msg: string) => void; onError: (m: string) => void; onCorrect: () => void }) {
+function GuidedActions({
+  run,
+  onUpdated,
+  onError,
+  onCorrect,
+  request,
+}: {
+  run: RunRecord;
+  onUpdated: (r: RunRecord, msg: string) => void;
+  onError: (m: string) => void;
+  onCorrect: () => void;
+  request?: { id: ReviewActionId; n: number } | null; // opened from the checklist
+}) {
   const options = availableActions(run);
   const [active, setActive] = useState<ReviewActionId | null>(null);
+  const formRef = useRef<HTMLElement>(null);
+  useEffect(() => {
+    if (!request) return;
+    setActive(request.id);
+    setTimeout(() => formRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 30);
+  }, [request]);
   const [reviewer, setReviewer] = useReviewer();
   const [note, setNote] = useState("");
   const [verified, setVerified] = useState(false);
@@ -414,10 +533,14 @@ function GuidedActions({ run, onUpdated, onError, onCorrect }: { run: RunRecord;
     );
   };
   return (
-    <section className="sec">
+    <section className="sec" id="resolve" ref={formRef}>
       <div className="sec-head">
         <h3>Resolve</h3>
-        <span className="muted small">Choose an action. Every decision is logged with your name and reason.</span>
+        <span className="muted small">Every action is logged with your name and reason.</span>
+      </div>
+      <div className="next">
+        <span className="next-k">Recommended next step</span>
+        <span>{nextStep(run, open)}</span>
       </div>
       <div className="acts">
         {primary.map(card)}
@@ -496,33 +619,76 @@ function GuidedActions({ run, onUpdated, onError, onCorrect }: { run: RunRecord;
   );
 }
 
-// ---------------- Control checklist (Detailed view) ----------------
+// ---------------- "Before this invoice can be approved" checklist ----------------
+// Derived from the findings and their resolution state (lib/controls.ts);
+// resolving a control in Resolve updates it immediately.
 
-const CONTROLS: { stage: StageId; label: string }[] = [
-  { stage: "validate", label: "Document & arithmetic" },
-  { stage: "vendor", label: "Vendor & bank account" },
-  { stage: "po_match", label: "Purchase order" },
-  { stage: "duplicates", label: "Duplicates" },
-];
-
-function Checklist({ run }: { run: RunRecord }) {
-  const resolved = run.resolvedCodes ?? [];
+function ControlsChecklist({ run, onAction }: { run: RunRecord; onAction: (a: ControlAction) => void }) {
+  const items = deriveControls(run);
+  const unresolved = items.filter((i) => i.status === "unresolved");
+  const closed = run.status === "approved" || run.status === "rejected";
+  const jump = (id: string) => document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "center" });
+  const icon = { passed: <Check size={14} strokeWidth={3} />, resolved: <Check size={14} strokeWidth={3} />, unresolved: <TriangleAlert size={13} strokeWidth={2.6} />, na: <CircleDashed size={14} /> };
+  const statusText = { passed: "Passed", resolved: "Resolved", unresolved: "Unresolved", na: "Not applicable" };
   return (
-    <ul className="checks">
-      {CONTROLS.map((c) => {
-        const fs = run.findings.filter((f) => f.stage === c.stage && f.action !== "info");
-        const open = fs.filter((f) => !resolved.includes(f.code));
-        const worst = open.reduce((m, f) => Math.max(m, SEVERITY[f.action].rank), 0);
-        const cls = !open.length ? "ck-ok" : worst >= 2 ? "ck-bad" : "ck-warn";
-        return (
-          <li key={c.stage} className={cls}>
-            <span className="ck-i">{!open.length ? <Check size={14} strokeWidth={3} /> : "!"}</span>
-            <span className="ck-l">{c.label}</span>
-            <span className="ck-r">{!open.length ? (fs.length ? "Resolved by reviewer" : "Passed") : open.map((f) => REASON_LABEL[f.code]).join(", ")}</span>
-          </li>
-        );
-      })}
-    </ul>
+    <section className="sec" id="controls">
+      <div className="sec-head">
+        <h3>{closed ? "Controls" : "Before this invoice can be approved"}</h3>
+      </div>
+      <ul className="ctl">
+        {items.map((c) => {
+          const text = c.status === "unresolved" ? (SHORT[c.open[0]] ?? REASON_LABEL[c.open[0]]) : c.status === "resolved" ? c.resolvedBy : PASS_TEXT[c.key];
+          return (
+            <li key={c.key} className={`ctl-${c.status}`}>
+              <span className="ctl-i" aria-hidden>
+                {icon[c.status]}
+              </span>
+              <div className="ctl-body">
+                <div className="ctl-top">
+                  <b>{c.label}</b>
+                  <span className="ctl-st">{statusText[c.status]}</span>
+                </div>
+                <div className="ctl-text">{text}</div>
+                {c.status === "unresolved" && c.open.length > 1 && <div className="ctl-more">Also: {c.open.slice(1).map((x) => REASON_LABEL[x]).join(", ")}</div>}
+              </div>
+              <div className="ctl-acts">
+                {c.status !== "na" && (
+                  <button className="link-btn small" onClick={() => jump(c.evidenceId)}>
+                    Evidence
+                  </button>
+                )}
+                {c.action && !closed && (
+                  <button className="btn btn-sm" onClick={() => onAction(c.action!.id)}>
+                    {c.action.label} <ArrowRight size={13} />
+                  </button>
+                )}
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+      <div className={`ctl-foot ${unresolved.length ? "ctl-foot-locked" : ""}`}>
+        {closed ? (
+          run.status === "approved" ? (
+            <>
+              <Check size={15} /> Approved for the payment run · not yet paid
+            </>
+          ) : (
+            <>
+              <Ban size={15} /> Closed · no payable created
+            </>
+          )
+        ) : unresolved.length ? (
+          <>
+            <Lock size={15} /> {unresolved.length} unresolved control{unresolved.length > 1 ? "s" : ""} · Payment approval locked
+          </>
+        ) : (
+          <>
+            <ShieldCheck size={15} /> All controls satisfied · ready for an explicit approval
+          </>
+        )}
+      </div>
+    </section>
   );
 }
 
@@ -538,6 +704,7 @@ export function Investigation({
   notify,
   headerExtra,
   onViewDocument,
+  onHighlight,
 }: {
   run: RunRecord;
   allRuns: RunRecord[];
@@ -548,12 +715,25 @@ export function Investigation({
   notify: (m: string, kind?: "ok" | "err") => void;
   headerExtra?: ReactNode;
   onViewDocument?: () => void; // queue: open the document in a side-by-side split instead of a modal
+  onHighlight?: (h: Highlight | null) => void; // queue: show the located field in its split document
 }) {
   const [density, setDensity] = useDensity();
   const detailed = density === "detailed";
   const [editing, setEditing] = useState(false);
   const [poPatch, setPoPatch] = useState<string | null>(null);
   const [docOpen, setDocOpen] = useState(false);
+  const [hl, setHl] = useState<(Highlight & { field: string }) | null>(null);
+  const [request, setRequest] = useState<{ id: ReviewActionId; n: number } | null>(null);
+  const showHl = (h: (Highlight & { field: string }) | null) => {
+    setHl(h);
+    onHighlight?.(h);
+  };
+  const onLocate = (field: string, label: string, kind: LocateKind, value: string | number | null) => showHl({ ...locateField(run, label, kind, value), field });
+  const onControl = (a: ControlAction) => (a === "correct" ? startCorrect() : setRequest({ id: a, n: Date.now() }));
+  const kind = attemptKind(run);
+  const original = run.duplicateOf?.runId ? allRuns.find((r) => r.id === run.duplicateOf!.runId) : undefined;
+  const checks = invoiceChecks(run);
+  const ready = paymentReadiness(run);
   const open = openCodes(run);
   const resolved = run.resolvedCodes ?? [];
   const primary = run.findings.find((f) => run.decision.decidingCodes.includes(f.code) && !resolved.includes(f.code)) ?? run.findings.find((f) => f.action !== "info" && !resolved.includes(f.code));
@@ -563,7 +743,6 @@ export function Investigation({
   const fieldsMatter = editing || open.some((c) => ["HANDWRITTEN_DOCUMENT", "LOW_EXTRACTION_CONFIDENCE", "ARITHMETIC_MISMATCH", "MISSING_FIELD"].includes(c));
   const poMatters = open.some((c) => ["PO_MATCH_UNCONFIRMED", "MISSING_PO_REFERENCE", "UNKNOWN_PO"].includes(c));
   const others = run.findings.filter((f) => f !== primary && (detailed || f.action !== "info"));
-  const actionLabel = isOpen(run.status) ? ACTION_GROUPS.find((g) => g.key === requiredAction(run, open))?.label : null;
   const saved = (r: RunRecord, msg: string) => {
     onUpdated(r);
     notify(msg);
@@ -593,13 +772,42 @@ export function Investigation({
             <Attribution kind="rules">{lastReview ? `Decided by ${lastReview.actor}` : "Decided by rules"}</Attribution>
           </span>
         </div>
-        <div className="decision-status">{statusLabel(run.status)}</div>
+        <div className="decision-status">{kind === "original" ? statusLabel(run.status) : "Duplicate submission blocked"}</div>
         <h2 className="decision-title">{decisionTitle}</h2>
         <p className="decision-line">{decisionLine}</p>
-        <div className="next">
-          <span className="next-k">{actionLabel ?? "Next step"}</span>
-          <span>{nextStep(run, open)}</span>
-        </div>
+        {kind !== "original" && run.duplicateOf && (
+          <div className="dup-note">
+            <div>
+              <b>No second payable was created.</b> This upload repeats <span className="mono">{run.duplicateOf.invoiceNumber}</span>
+              {kind === "duplicate_of_paid" ? (
+                <>, which is already paid (ERP payment record).</>
+              ) : original ? (
+                <>
+                  . The original invoice is still <StatusBadge status={original.status} />
+                  {isOpen(original.status) ? " and its own controls still need resolving." : "."}
+                </>
+              ) : (
+                <>, which is already on file.</>
+              )}
+            </div>
+            {original && (
+              <a className="btn btn-sm" href={`/invoice/${original.id}?from=history`}>
+                Open original invoice <ArrowRight size={13} />
+              </a>
+            )}
+          </div>
+        )}
+        {kind === "original" && (
+          <div className="ready">
+            <span className={`ready-pill rp-${checks === "Passed" ? "ok" : checks === "Incomplete" ? "warn" : "bad"}`}>
+              <small>Invoice checks</small> {checks}
+            </span>
+            <span className={`ready-pill rp-${ready.label === "Ready" ? "ok" : ready.label === "Closed" ? "muted" : ready.label === "Awaiting approval" ? "info" : ready.label === "Awaiting verification" ? "warn" : "bad"}`} title={ready.detail}>
+              <small>Payment readiness</small> {ready.label}
+            </span>
+            <span className="muted small">{ready.detail}</span>
+          </div>
+        )}
         {detailed && (
           <div className="decision-detail">
             <div>
@@ -615,21 +823,14 @@ export function Investigation({
         )}
       </section>
 
-      {detailed && (
-        <section className="sec">
-          <div className="sec-head">
-            <h3>All validation checks</h3>
-          </div>
-          <Checklist run={run} />
-        </section>
-      )}
+      {kind === "original" && <ControlsChecklist run={run} onAction={onControl} />}
 
       <section className="sec">
         <div className="sec-head">
           <h3>Evidence</h3>
-          {!detailed && <span className="muted small">Most important comparison</span>}
+          {!detailed && <span className="muted small">For the open controls · Detailed view shows every check</span>}
         </div>
-        <EvidenceStack run={run} limit={detailed ? undefined : 1} />
+        <EvidenceStack run={run} relevantOnly={!detailed} />
       </section>
 
       {(detailed || poMatters) && (
@@ -643,9 +844,20 @@ export function Investigation({
         />
       )}
 
-      {(detailed || fieldsMatter) && <FieldsPanel run={run} editing={editing} setEditing={setEditing} patch={poPatch ? { poReference: poPatch } : null} onSaved={(r) => saved(r, `Fields corrected · all checks re-run · now ${statusLabel(r.status)}`)} onError={(m) => notify(m, "err")} />}
+      {(detailed || fieldsMatter) && (
+        <FieldsPanel
+          run={run}
+          editing={editing}
+          setEditing={setEditing}
+          patch={poPatch ? { poReference: poPatch } : null}
+          onSaved={(r) => saved(r, `Fields corrected · all checks re-run · now ${statusLabel(r.status)}`)}
+          onError={(m) => notify(m, "err")}
+          onLocate={onLocate}
+          selected={hl?.field}
+        />
+      )}
 
-      <GuidedActions run={run} onUpdated={saved} onError={(m) => notify(m, "err")} onCorrect={startCorrect} />
+      {kind === "original" || isOpen(run.status) ? <GuidedActions run={run} onUpdated={saved} onError={(m) => notify(m, "err")} onCorrect={startCorrect} request={request} /> : null}
 
       {others.length > 0 && (
         <section className="sec">
@@ -731,7 +943,7 @@ export function Investigation({
         right
       ) : (
         <div className="inv-split">
-          <DocumentViewer src={src} href={href} title={run.fileName} meta={`${run.pageCount} page${run.pageCount > 1 ? "s" : ""} · ${run.invoice.documentType}`} />
+          <DocumentViewer src={src} href={href} title={run.fileName} meta={`${run.pageCount} page${run.pageCount > 1 ? "s" : ""} · ${run.invoice.documentType}`} highlight={hl} onClearHighlight={() => showHl(null)} />
           {right}
         </div>
       )}
