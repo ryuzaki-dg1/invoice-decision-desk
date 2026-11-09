@@ -4,7 +4,7 @@
 // correct the fields (revalidate.ts) and these recompute.
 
 import type { ExceptionCode, RunRecord } from "../types.ts";
-import { NEEDS_CORRECTION, PO_DISCREPANCY, type ReviewActionId } from "./review.ts";
+import { NEEDS_CORRECTION, PO_DISCREPANCY, auditActionId, type ReviewActionId } from "./review.ts";
 
 export type ControlStatus = "passed" | "unresolved" | "resolved" | "na";
 export type ControlAction = ReviewActionId | "correct";
@@ -17,12 +17,22 @@ export interface ControlItem {
   resolvedBy?: string; // reviewer + action that resolved it
   action?: { id: ControlAction; label: string };
   evidenceId: string; // DOM id of the supporting evidence block
+  // Passed, but with something the reviewer should not read as "verified"
+  // (e.g. no bank details printed). Never blocks approval; never says "Passed".
+  caution?: { label: string; text: string };
+}
+
+// What the invoice itself says about where to pay. "Matches the account on
+// file" is only claimed when digits were printed and compared.
+export function bankCheck(run: RunRecord): "compared" | "missing" | "short" {
+  const d = (run.invoice.bankAccount ?? "").replace(/\D/g, "");
+  return d.length === 0 ? "missing" : d.length < 4 ? "short" : "compared";
 }
 
 const GROUPS: { key: ControlItem["key"]; label: string; codes: ExceptionCode[]; evidenceId: string; pass: string }[] = [
   { key: "document", label: "Document read & arithmetic", codes: ["MISSING_FIELD", "ARITHMETIC_MISMATCH", "HANDWRITTEN_DOCUMENT", "LOW_EXTRACTION_CONFIDENCE"], evidenceId: "ev-math", pass: "All required fields present; totals reconcile." },
   { key: "vendor", label: "Vendor identity", codes: ["UNKNOWN_VENDOR", "VENDOR_BLOCKED", "PO_VENDOR_MISMATCH"], evidenceId: "ev-vendor", pass: "Payee matches the approved vendor master." },
-  { key: "payment", label: "Payment details", codes: ["BANK_ACCOUNT_MISMATCH"], evidenceId: "ev-vendor", pass: "Remit-to account matches the account on file (or none printed)." },
+  { key: "payment", label: "Payment details", codes: ["BANK_ACCOUNT_MISMATCH"], evidenceId: "ev-vendor", pass: "Remit-to account matches the account on file." },
   { key: "po", label: "Purchase order", codes: ["PO_MATCH_UNCONFIRMED", "MISSING_PO_REFERENCE", "UNKNOWN_PO", ...PO_DISCREPANCY], evidenceId: "ev-po", pass: "Within PO value, quantities and prices (cumulative)." },
   { key: "duplicate", label: "Duplicate check", codes: ["DUPLICATE_INVOICE", "POSSIBLE_DUPLICATE"], evidenceId: "ev-dup", pass: "Not a repeat of an invoice already on file." },
   { key: "limit", label: "Approval limit", codes: ["OVER_APPROVAL_LIMIT"], evidenceId: "ev-math", pass: "Within the auto-approval limit." },
@@ -30,10 +40,12 @@ const GROUPS: { key: ControlItem["key"]; label: string; codes: ExceptionCode[]; 
 
 export const PASS_TEXT: Record<ControlItem["key"], string> = Object.fromEntries(GROUPS.map((g) => [g.key, g.pass])) as Record<ControlItem["key"], string>;
 
-function actionFor(key: ControlItem["key"], open: ExceptionCode[]): ControlItem["action"] {
+function actionFor(key: ControlItem["key"], open: ExceptionCode[], run: RunRecord): ControlItem["action"] {
   const has = (...c: ExceptionCode[]) => c.some((x) => open.includes(x));
   switch (key) {
     case "document":
+      // A genuinely missing invoice number is the vendor's to supply: ask for a revised invoice, never type one in.
+      if (has("MISSING_FIELD") && !run.invoice.invoiceNumber) return { id: "request_info", label: "Request revised invoice" };
       return has(...NEEDS_CORRECTION) ? { id: "correct", label: "Correct extracted fields" } : { id: "confirm_fields", label: "Confirm extracted information" };
     case "vendor":
       return { id: "request_info", label: "Request vendor onboarding" };
@@ -60,15 +72,18 @@ export function deriveControls(run: RunRecord): ControlItem[] {
     const open = mine.filter((c) => !resolved.has(c));
     let status: ControlStatus = !mine.length ? "passed" : open.length ? "unresolved" : "resolved";
     if (g.key === "po" && !run.poMatch.po && !mine.length) status = "na";
+    const bank = g.key === "payment" && status === "passed" ? bankCheck(run) : "compared";
+    const caution = bank === "missing" ? { label: "Not provided", text: "No bank details on the invoice. Payment would go to the account on file; nothing here was verified." } : bank === "short" ? { label: "Not verified", text: "Too few digits printed to compare with the account on file." } : undefined;
     const ev = status === "resolved" ? [...run.audit].reverse().find((e) => e.kind === "reviewer" && e.resolved?.some((c) => mine.includes(c))) : undefined;
     items.push({
       key: g.key,
       label: g.label,
       status,
       open,
-      resolvedBy: ev ? `${ev.action} · ${ev.actor}` : status === "resolved" ? "Resolved by reviewer" : undefined,
-      action: status === "unresolved" && !(g.key === "duplicate" && open.includes("DUPLICATE_INVOICE")) ? actionFor(g.key, open) : undefined,
+      resolvedBy: ev ? (auditActionId(ev) === "verify_bank" ? `Verification recorded (reviewer-attested) · ${ev.actor}` : `${ev.action} · ${ev.actor}`) : status === "resolved" ? "Resolved by reviewer" : undefined,
+      action: status === "unresolved" && !(g.key === "duplicate" && open.includes("DUPLICATE_INVOICE")) ? actionFor(g.key, open, run) : undefined,
       evidenceId: g.evidenceId,
+      caution,
     });
   }
   return items;

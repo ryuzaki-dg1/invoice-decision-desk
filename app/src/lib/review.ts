@@ -24,7 +24,8 @@ export interface ReviewRequest {
   action: ReviewActionId;
   reviewer: string;
   justification: string;
-  verificationConfirmed?: boolean;
+  verificationConfirmed?: boolean; // verify_bank: reviewer's explicit manual attestation
+  verificationReference?: string; // verify_bank: call reference (who was spoken to, when, ticket no.)
   authorizedBy?: string; // resolve_po: PO owner / budget holder who authorised
   reference?: string; // resolve_po: amendment or approval reference
 }
@@ -46,6 +47,26 @@ export const NEEDS_CORRECTION: ExceptionCode[] = ["ARITHMETIC_MISMATCH", "MISSIN
 const FIELD_CONFIRM: ExceptionCode[] = ["HANDWRITTEN_DOCUMENT", "LOW_EXTRACTION_CONFIDENCE"];
 // Judgement calls a reviewer may accept with a written justification.
 const APPROVE_RESOLVES: ExceptionCode[] = ["POSSIBLE_DUPLICATE", "OVER_APPROVAL_LIMIT"];
+
+const GENERIC = /^(ok(ay)?|fine|looks? (fine|good|ok|legit)|seems? (fine|legit|ok|good)|approved?|done|checked|verified|confirmed|n\/?a|none|test|asdf+|yes|lgtm|all good|good)\W*$/i;
+
+// A justification has to say something: at least 15 characters, 3 words, and
+// not a stock phrase. Shared by review actions and field corrections; enforced
+// on the server too.
+export function justificationError(text: string, what = "justification"): string | null {
+  const t = (text ?? "").trim();
+  if (t.length < 15 || t.split(/\s+/).length < 3 || GENERIC.test(t)) return `Give a specific ${what} (at least 15 characters, saying what was checked and with whom or against what).`;
+  return null;
+}
+
+// Events written before actionId existed are recognised by their stored text.
+export function auditActionId(e: AuditEvent): string | undefined {
+  if (e.kind !== "reviewer") return undefined;
+  if (e.actionId) return e.actionId;
+  if (/^Verified payment details/.test(e.action)) return "verify_bank";
+  if (/^Resolved PO discrepancy/.test(e.action)) return "resolve_po";
+  return undefined;
+}
 
 export function openCodes(run: RunRecord): ExceptionCode[] {
   const resolved = new Set(run.resolvedCodes ?? []);
@@ -91,7 +112,7 @@ export function availableActions(run: RunRecord): ActionOption[] {
 }
 
 const ACTION_TEXT: Record<ReviewActionId, string> = {
-  verify_bank: "Verified payment details by independent call-back",
+  verify_bank: "Reviewer attested bank details verified by call-back (not independently verified by the system)",
   confirm_po: "Confirmed suggested PO",
   confirm_fields: "Confirmed extracted information against the original document",
   resolve_po: "Resolved PO discrepancy with authorisation",
@@ -114,11 +135,13 @@ export function applyReviewAction(run: RunRecord, req: ReviewRequest, now = Date
   const reviewer = (req.reviewer ?? "").trim();
   const justification = (req.justification ?? "").trim();
   if (!reviewer) return { ok: false, error: "Reviewer name is required." };
-  if (justification.length < 5) return { ok: false, error: "A justification is required for the audit trail." };
+  const jErr = justificationError(justification);
+  if (jErr) return { ok: false, error: jErr };
   const option = availableActions(run).find((o) => o.id === req.action);
   if (!option) return { ok: false, error: `"${req.action}" is not available for a case that is ${run.status.replace("_", " ")}.` };
   if (!option.allowed) return { ok: false, error: option.blockedReason ?? "Action not allowed." };
-  if (option.needsVerification && !req.verificationConfirmed) return { ok: false, error: "Confirm that the bank change was independently verified with the trusted contact on file." };
+  if (option.needsVerification && !req.verificationConfirmed) return { ok: false, error: "Tick the attestation: you personally verified the bank change with the trusted contact on file." };
+  if (option.needsVerification && (req.verificationReference ?? "").trim().length < 3) return { ok: false, error: "Enter a verification reference (who you spoke to, date/time or ticket number)." };
   if (option.needsAuthorization && (!req.authorizedBy?.trim() || !req.reference?.trim())) return { ok: false, error: "Record who authorised the PO change and the amendment or approval reference." };
 
   const before = openCodes(run);
@@ -157,7 +180,9 @@ export function applyReviewAction(run: RunRecord, req: ReviewRequest, now = Date
     note: justification,
     resolved: before.filter((c) => resolved.includes(c)),
     remaining: to === "approved" || to === "rejected" ? [] : [...new Set(remaining)],
-    reference: req.action === "resolve_po" ? `Authorised by ${req.authorizedBy!.trim()} · ref ${req.reference!.trim()}` : undefined,
+    reference: req.action === "resolve_po" ? `Authorised by ${req.authorizedBy!.trim()} · ref ${req.reference!.trim()}` : req.action === "verify_bank" ? `Call-back ref ${req.verificationReference!.trim()} · reviewer-attested` : undefined,
+    actionId: req.action,
+    attested: req.action === "verify_bank" ? true : undefined,
   };
   return { ok: true, run: { ...run, status: to, resolvedCodes: resolved, audit: [...run.audit, event] } };
 }

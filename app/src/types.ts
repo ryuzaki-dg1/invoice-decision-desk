@@ -209,6 +209,8 @@ export interface AuditEvent {
   resolved?: ExceptionCode[]; // findings this action resolved
   remaining?: ExceptionCode[]; // findings still open afterwards
   reference?: string; // e.g. PO amendment reference and authoriser
+  actionId?: string; // reviewer action that produced this event (verify_bank, resolve_po, ...)
+  attested?: boolean; // reviewer-attested (not independently verified by the software)
 }
 
 export interface DuplicateRef {

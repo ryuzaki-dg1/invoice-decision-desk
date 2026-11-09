@@ -1,9 +1,9 @@
 // Plain-language labels and "why it matters" text for each rule code, written
 // for an AP executive. Amounts come from the run; nothing here is invented.
 
-import { VENDORS } from "./data/vendors";
-import { money } from "./lib/engine";
-import type { ExceptionCode, RunRecord } from "./types";
+import { VENDORS } from "./data/vendors.ts";
+import { money } from "./lib/engine.ts";
+import type { ExceptionCode, RunRecord } from "./types.ts";
 
 export const REASON_LABEL: Record<ExceptionCode, string> = {
   MISSING_FIELD: "Missing required fields",
@@ -63,19 +63,24 @@ export const SHORT: Partial<Record<ExceptionCode, string>> = {
 export function nextStep(run: RunRecord, open: ExceptionCode[]): string {
   if (run.status === "approved") return "Eligible for the next payment run. Not yet paid.";
   if (run.status === "rejected") return "Nothing to do. No payable was created.";
+  if (open.length === 0 && run.status !== "awaiting_info") return "Approve for the payment run, or reject.";
   const v = VENDORS.find((x) => x.id === run.vendorId);
   const po = run.poMatch.po;
   switch (requiredAction(run, open)) {
     case "bank":
       return `Verify the bank change by calling ${v ? `${v.name} on ${v.phone}` : "the vendor"}, the contact already on file.`;
+    case "clarify":
+      return `Request a revised invoice from ${v?.name ?? run.invoice.vendor}. The invoice number is missing, so it can't be booked or checked for duplicates. Don't enter one manually.`;
     case "onboard":
       return "Send the vendor to procurement for onboarding. It can't be approved until then.";
     case "fields":
+      if (open.includes("MISSING_FIELD") && !run.invoice.invoiceNumber) return "Request a revised invoice from the vendor. The invoice number is missing and must not be entered manually.";
+      if (open.includes("ARITHMETIC_MISMATCH")) return "Request a corrected invoice, or correct a figure only where the document clearly shows it.";
       return "Check the highlighted figures against the original, then correct or confirm them.";
     case "po":
       return po ? `Confirm ${po.id} with ${po.approvedBy}, or assign the right PO.` : "Ask the requester which PO this invoice belongs to.";
     case "po_amount":
-      return run.decision.nextAction.replace(/^\d\.\s*/, "").split(/ \d\. /)[0];
+      return poAmountStep(run, open);
     case "dup":
       return "Ask the vendor whether this re-issues an invoice already on file.";
     case "waiting":
@@ -85,10 +90,29 @@ export function nextStep(run: RunRecord, open: ExceptionCode[]): string {
   }
 }
 
+// Next step for an open PO discrepancy, from the findings still open now.
+// Never implies the PO record itself has been updated.
+function poAmountStep(run: RunRecord, open: ExceptionCode[]): string {
+  const po = run.poMatch.po;
+  const b = run.poMatch.billing;
+  const who = run.vendorMatched ?? run.invoice.vendor;
+  const owner = po?.approvedBy ?? "the PO owner";
+  const amend = `Obtain a PO amendment or authorisation from ${owner}, then record the reference here. The PO record is not changed by this app.`;
+  if (open.includes("CUMULATIVE_PO_EXCEEDED") && po && b) {
+    const left = b.poTotal - b.previouslyBilled;
+    return left > 0.005 ? `Only ${money(left, po.currency)} remains on ${po.id}. Request a corrected invoice from ${who}, or ${amend.charAt(0).toLowerCase()}${amend.slice(1)}` : `${po.id} is already fully billed. ${amend} Or request a corrected invoice from ${who}.`;
+  }
+  if (open.includes("PO_AMOUNT_EXCEEDED") || open.includes("QUANTITY_EXCEEDS_PO") || open.includes("PRICE_VARIANCE") || open.includes("LINE_NOT_ON_PO")) return `Request a corrected invoice from ${who}, or ${amend.charAt(0).toLowerCase()}${amend.slice(1)}`;
+  if (open.includes("EXPIRED_PO") || open.includes("CLOSED_PO")) return `Ask ${owner} to re-authorise the PO, then record the reference here.`;
+  if (open.includes("PENDING_PO_CONFLICT")) return `Decide with ${owner} which pending invoice the PO covers, then record the reference here.`;
+  return amend;
+}
+
 // What the analyst has to DO next, derived from the open controls. The queue
 // groups by this instead of by status.
-export type ActionKey = "bank" | "onboard" | "fields" | "po" | "po_amount" | "dup" | "review" | "waiting";
+export type ActionKey = "clarify" | "bank" | "onboard" | "fields" | "po" | "po_amount" | "dup" | "review" | "waiting";
 export const ACTION_GROUPS: { key: ActionKey; label: string; hint: string }[] = [
+  { key: "clarify", label: "Request revised invoice", hint: "A required detail is missing from the document" },
   { key: "bank", label: "Verify payment details", hint: "Call the trusted contact on file before releasing" },
   { key: "onboard", label: "Vendor onboarding", hint: "Payee is not in the vendor master" },
   { key: "fields", label: "Confirm extracted data", hint: "Handwritten, uncertain or inconsistent figures" },
@@ -104,6 +128,7 @@ export function requiredAction(run: RunRecord, open: ExceptionCode[]): ActionKey
   const any = (...c: ExceptionCode[]) => c.some((x) => open.includes(x));
   if (any("BANK_ACCOUNT_MISMATCH")) return "bank";
   if (any("UNKNOWN_VENDOR", "VENDOR_BLOCKED", "PO_VENDOR_MISMATCH")) return "onboard";
+  if (any("MISSING_FIELD") && !run.invoice.invoiceNumber) return "clarify";
   if (any("ARITHMETIC_MISMATCH", "MISSING_FIELD", "HANDWRITTEN_DOCUMENT", "LOW_EXTRACTION_CONFIDENCE")) return "fields";
   if (any("PO_MATCH_UNCONFIRMED", "MISSING_PO_REFERENCE", "UNKNOWN_PO")) return "po";
   if (any("CUMULATIVE_PO_EXCEEDED", "PO_AMOUNT_EXCEEDED", "QUANTITY_EXCEEDS_PO", "PRICE_VARIANCE", "PENDING_PO_CONFLICT", "EXPIRED_PO", "CLOSED_PO", "LINE_NOT_ON_PO", "CURRENCY_MISMATCH")) return "po_amount";

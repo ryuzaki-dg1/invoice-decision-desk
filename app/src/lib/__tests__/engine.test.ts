@@ -7,13 +7,16 @@ import { PURCHASE_ORDERS } from "../../data/purchaseOrders.ts";
 import { ERP_LEDGER, VENDORS } from "../../data/vendors.ts";
 import type { Invoice, LedgerInvoice, RunRecord } from "../../types.ts";
 import { buildLedger, checkDuplicates, checkVendor, decide, fmtPct, initialStatus, matchPurchaseOrder, normalizeInvoiceNumber, suggestPos, validateInvoice, type PriorSubmission } from "../engine.ts";
-import { applyReviewAction, availableActions } from "../review.ts";
+import { applyReviewAction, availableActions, openCodes } from "../review.ts";
 import { applyCorrections } from "../revalidate.ts";
 import { buildCases, computeMetrics } from "../analytics.ts";
 import { attemptKind, deriveControls, invoiceChecks, paymentReadiness } from "../controls.ts";
 import { locate } from "../locate.ts";
 import { runPipeline } from "../pipeline.ts";
 import { DEFAULT_RULES } from "../policy.ts";
+import { caseSummary } from "../status.ts";
+import { refreshStale } from "../revalidate.ts";
+import { nextStep, requiredAction } from "../../copy.ts";
 
 const TODAY = "2026-11-05";
 
@@ -296,8 +299,8 @@ test("bank hold: approve is blocked until independent verification is recorded",
   assert.equal(r.status, "payment_hold");
   assert.equal(applyReviewAction(r, { action: "approve", reviewer: "Priya", justification: "Looks fine to me" }).ok, false);
   assert.equal(applyReviewAction(r, { action: "verify_bank", reviewer: "Priya", justification: "Looks fine to me" }).ok, false, "needs verification checkbox");
-  assert.equal(applyReviewAction(r, { action: "verify_bank", reviewer: " ", justification: "Called (216) 555-0190", verificationConfirmed: true }).ok, false, "needs a name");
-  const verified = applyReviewAction(r, { action: "verify_bank", reviewer: "Priya", justification: "Called Acme on (216) 555-0190, controller confirmed new account", verificationConfirmed: true });
+  assert.equal(applyReviewAction(r, { action: "verify_bank", reviewer: " ", justification: "Called (216) 555-0190 to confirm", verificationConfirmed: true, verificationReference: "Call 5 Nov 10:15, A. Rao" }).ok, false, "needs a name");
+  const verified = applyReviewAction(r, { action: "verify_bank", reviewer: "Priya", justification: "Called Acme on (216) 555-0190, controller confirmed new account", verificationConfirmed: true, verificationReference: "Call 5 Nov 10:15, A. Rao" });
   assert.ok(verified.ok);
   if (!verified.ok) return;
   assert.equal(verified.run.status, "needs_review", "verification clears the hold; approval is a separate, explicit step");
@@ -353,7 +356,7 @@ test("correction loop: a misread handwritten figure blocks approval until correc
   assert.ok(r0.findings.some((f) => f.code === "ARITHMETIC_MISMATCH"));
   assert.equal(availableActions(r0).find((a) => a.id === "approve")?.allowed, false);
 
-  const fixed = applyCorrections(r0, { reviewer: "Priya", reason: "Labour amount is 1850 on the photo (8 written over 3)", invoice: { lineItems: [{ unitPrice: 1850, total: 1850 }] } }, [r0]);
+  const fixed = applyCorrections(r0, { reviewer: "Priya", reason: "Labour amount is 1850 on the photo (8 written over 3)", source: "page 1 of the document", invoice: { lineItems: [{ unitPrice: 1850, total: 1850 }] } }, [r0]);
   assert.ok(fixed.ok);
   if (!fixed.ok) return;
   const r1 = fixed.run;
@@ -381,7 +384,7 @@ test("correction loop: a misread handwritten figure blocks approval until correc
 test("correction loop: a correction that creates a duplicate is rejected by the re-run checks", () => {
   const i = inv({ vendor: "Sunridge Chemicals", invoiceNumber: "SC-339O", poReference: "PO-2026-0211", lineItems: [{ description: "Industrial solvent XR-4 (drum, 55gal)", quantity: 8, unitPrice: 295, total: 2360 }], subtotal: 2360, tax: 188.8, total: 2548.8, documentType: "scanned", lowConfidenceFields: ["invoiceNumber"] });
   const r0 = asRun(i, run(i), "run-s");
-  const res = applyCorrections(r0, { reviewer: "Priya", reason: "Number on the scan is SC-3371", invoice: { invoiceNumber: "SC-3371" } }, [r0]);
+  const res = applyCorrections(r0, { reviewer: "Priya", reason: "Number on the scan is SC-3371", source: "page 1 of the document", invoice: { invoiceNumber: "SC-3371" } }, [r0]);
   assert.ok(res.ok);
   if (res.ok) {
     assert.equal(res.run.status, "rejected");
@@ -392,10 +395,10 @@ test("correction loop: a correction that creates a duplicate is rejected by the 
 test("correction loop: vendor and bank account cannot be edited; reason and name are required", () => {
   const r0 = asRun(BANK_CHANGE, run(BANK_CHANGE), "run-b2");
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const sneaky = applyCorrections(r0, { reviewer: "Priya", reason: "use master account", invoice: { bankAccount: "441022874821", vendor: "Acme" } as any }, [r0]);
+  const sneaky = applyCorrections(r0, { reviewer: "Priya", reason: "use master account", source: "page 1 of the document", invoice: { bankAccount: "441022874821", vendor: "Acme" } as any }, [r0]);
   assert.equal(sneaky.ok, false);
-  assert.equal(applyCorrections(r0, { reviewer: "", reason: "valid reason", invoice: { tax: 1 } }, [r0]).ok, false);
-  assert.equal(applyCorrections(r0, { reviewer: "Priya", reason: "", invoice: { tax: 1 } }, [r0]).ok, false);
+  assert.equal(applyCorrections(r0, { reviewer: "", reason: "valid reason", source: "page 1 of the document", invoice: { tax: 1 } }, [r0]).ok, false);
+  assert.equal(applyCorrections(r0, { reviewer: "Priya", reason: "", source: "page 1 of the document", invoice: { tax: 1 } }, [r0]).ok, false);
 });
 
 // ---------- Multi-finding safety ----------
@@ -415,7 +418,7 @@ const BLUEPEAK = inv({
 test("bank mismatch + PO overage: verifying the bank does NOT approve; PO stays open until authorised", () => {
   const r0 = asRun(BLUEPEAK, run(BLUEPEAK), "run-bp");
   assert.equal(r0.status, "payment_hold");
-  const v = applyReviewAction(r0, { action: "verify_bank", reviewer: "Priya", justification: "Called Bluepeak on file number", verificationConfirmed: true });
+  const v = applyReviewAction(r0, { action: "verify_bank", reviewer: "Priya", justification: "Called Bluepeak on the file number", verificationConfirmed: true, verificationReference: "Call 5 Nov 10:15, A. Rao" });
   assert.ok(v.ok);
   if (!v.ok) return;
   assert.equal(v.run.status, "needs_review", "hold cleared, but not approved");
@@ -462,7 +465,7 @@ test("checklist: bank + PO overage → verify bank resolves only the bank contro
   assert.equal(c0.find((x) => x.key === "po")?.action?.id, "resolve_po");
   assert.equal(invoiceChecks(r0), "Exceptions found");
   assert.equal(paymentReadiness(r0).label, "Blocked");
-  const v = applyReviewAction(r0, { action: "verify_bank", reviewer: "P", justification: "called on file", verificationConfirmed: true });
+  const v = applyReviewAction(r0, { action: "verify_bank", reviewer: "P", justification: "called on the number on file", verificationConfirmed: true, verificationReference: "Call 5 Nov 10:15, A. Rao" });
   assert.ok(v.ok);
   if (!v.ok) return;
   const c1 = deriveControls(v.run);
@@ -551,11 +554,11 @@ test("analytics: unique cases vs attempts, STP denominator, open value, reset", 
   const hold = asRun(BANK_CHANGE, run(BANK_CHANGE), "a4");
   const human = (() => {
     const r = asRun(BLUEPEAK, run(BLUEPEAK), "a5");
-    let x = applyReviewAction(r, { action: "verify_bank", reviewer: "P", justification: "called on file" , verificationConfirmed: true });
+    let x = applyReviewAction(r, { action: "verify_bank", reviewer: "P", justification: "called on the number on file" , verificationConfirmed: true, verificationReference: "Call 5 Nov 10:15, A. Rao" });
     if (!x.ok) throw new Error();
-    x = applyReviewAction(x.run, { action: "resolve_po", reviewer: "P", justification: "amended", authorizedBy: "a.patel", reference: "A1" });
+    x = applyReviewAction(x.run, { action: "resolve_po", reviewer: "P", justification: "PO amended by the owner", authorizedBy: "a.patel", reference: "A1" });
     if (!x.ok) throw new Error();
-    x = applyReviewAction(x.run, { action: "approve", reviewer: "P", justification: "all resolved" });
+    x = applyReviewAction(x.run, { action: "approve", reviewer: "P", justification: "all controls resolved" });
     if (!x.ok) throw new Error();
     return x.run;
   })();
@@ -584,7 +587,7 @@ test("corrections re-validate with the run's own policy snapshot, not today's de
   const i = inv({ vendor: "Sunridge Chemicals Ltd.", invoiceNumber: "SC-3390", poReference: "PO-2026-0211", lineItems: [{ description: "Industrial solvent XR-4 (drum, 55gal)", quantity: 10, unitPrice: 295, total: 2950 }], subtotal: 2950, tax: 236, total: 3186, issueDate: "2026-11-03" });
   const loose = { ...DEFAULT_RULES, amountTolerancePct: 0.15, quantityTolerance: 5 };
   const r0 = { ...asRun(i, run(i), "snap"), rules: loose };
-  const res = applyCorrections(r0, { reviewer: "Priya", reason: "Date reads Nov 4 on the copy", invoice: { issueDate: "2026-11-04" } }, [r0]);
+  const res = applyCorrections(r0, { reviewer: "Priya", reason: "Date reads Nov 4 on the copy", source: "page 1 of the document", invoice: { issueDate: "2026-11-04" } }, [r0]);
   assert.ok(res.ok);
   if (res.ok) {
     assert.ok(!res.run.findings.some((f) => f.code === "CUMULATIVE_PO_EXCEEDED"), "10% over is inside the run's 15% snapshot");
@@ -637,4 +640,311 @@ test("rejected and approved cases are final", () => {
   const r = asRun(HAPPY, run(HAPPY), "run-h");
   assert.equal(availableActions(r).length, 0);
   assert.equal(applyReviewAction(r, { action: "reject", reviewer: "Priya", justification: "changed my mind" }).ok, false);
+});
+
+// ---------- regression: current-state messaging and reviewer validation ----------
+
+const VERIFY = { action: "verify_bank" as const, reviewer: "Priya", justification: "Called Bluepeak on the number in the vendor master", verificationConfirmed: true, verificationReference: "Call 5 Nov 10:15, A. Rao" };
+
+test("status: after bank call-back, summary says verification recorded (attested), not 'call the vendor'", () => {
+  const r0 = asRun(BANK_CHANGE, run(BANK_CHANGE), "run-bc");
+  assert.equal(r0.status, "payment_hold");
+  assert.match(nextStep(r0, ["BANK_ACCOUNT_MISMATCH"]), /calling/i);
+  const v = applyReviewAction(r0, VERIFY);
+  assert.ok(v.ok);
+  if (!v.ok) return;
+  const s = caseSummary(v.run);
+  assert.match(s.title, /Verification recorded — awaiting approval/);
+  assert.doesNotMatch(s.next, /call/i);
+  assert.equal(s.bankAttested?.by, "Priya");
+  assert.match(v.run.audit.at(-1)!.action, /attested/i);
+  assert.doesNotMatch(v.run.audit.at(-1)!.action, /^Verified/);
+  assert.ok(v.run.findings.some((f) => f.code === "BANK_ACCOUNT_MISMATCH"), "original finding preserved");
+});
+
+test("status: approved with authorised PO exception never says 'within tolerance' or 'all checks passed'", () => {
+  const r0 = asRun(BLUEPEAK, run(BLUEPEAK), "run-bp2");
+  const v = applyReviewAction(r0, VERIFY);
+  assert.ok(v.ok);
+  if (!v.ok) return;
+  const mid = caseSummary(v.run);
+  assert.match(mid.title, /Bank verification recorded/);
+  assert.match(mid.next, /amendment or authorisation/);
+  assert.match(mid.next, /not changed/);
+  const po = applyReviewAction(v.run, { action: "resolve_po", reviewer: "Priya", justification: "Price increase approved by PO owner", authorizedBy: "a.patel", reference: "PO-2026-0184-A1" });
+  assert.ok(po.ok);
+  if (!po.ok) return;
+  assert.match(caseSummary(po.run).title, /awaiting approval/);
+  const ok = applyReviewAction(po.run, { action: "approve", reviewer: "Priya", justification: "All controls resolved and recorded" });
+  assert.ok(ok.ok);
+  if (!ok.ok) return;
+  const s = caseSummary(ok.run);
+  assert.equal(s.title, "Approved with authorised PO exception");
+  assert.doesNotMatch(`${s.title} ${s.line}`, /within PO tolerance|all checks passed|items? to resolve/i);
+  assert.match(s.line, /PO-2026-0184-A1/);
+  assert.match(s.line, /PO record unchanged/);
+  assert.ok(ok.run.findings.some((f) => f.code === "PO_AMOUNT_EXCEEDED"), "original discrepancy retained");
+  assert.equal(ok.run.audit.filter((e) => e.kind === "reviewer").length, 3, "audit history intact");
+});
+
+test("status: a clean approval still reads 'all checks passed'", () => {
+  const r = asRun(HAPPY, run(HAPPY), "run-ok");
+  assert.equal(r.status, "approved");
+  assert.match(caseSummary(r).title, /all checks passed/i);
+});
+
+test("next step: fully billed PO never says '$0 still open' and does not imply the PO was updated", () => {
+  const i = inv({ vendor: "Sunridge Chemicals Ltd.", invoiceNumber: "SC-3391", poReference: "PO-2026-0211", lineItems: [{ description: "Industrial solvent XR-4 (drum, 55gal)", quantity: 10, unitPrice: 295, total: 2950 }], subtotal: 2950, tax: 236, total: 3186 });
+  const r = run(i, [...ERP_LEDGER], "h-x", []);
+  const base = asRun(i, r, "run-full");
+  const full = { ...base, poMatch: { ...base.poMatch, billing: { ...base.poMatch.billing!, previouslyBilled: base.poMatch.billing!.poTotal } }, findings: base.findings.map((f) => f) };
+  const text = nextStep(full, ["CUMULATIVE_PO_EXCEEDED"]);
+  assert.doesNotMatch(text, /\$0(\.00)? still open/);
+  assert.match(text, /fully billed/);
+  assert.match(text, /PO record is not changed/);
+});
+
+test("missing invoice number: recommends a revised invoice and rejects manual entry", () => {
+  const i = inv({ ...HAPPY, invoiceNumber: null });
+  const r0 = asRun(i, run(i), "run-nonum");
+  assert.ok(r0.findings.some((f) => f.code === "MISSING_FIELD"));
+  assert.match(nextStep(r0, ["MISSING_FIELD"]), /revised invoice/i);
+  const res = applyCorrections(r0, { reviewer: "Priya", reason: "The number appears on the document", source: "page 1 header", invoice: { invoiceNumber: "INV-9999" } }, [r0]);
+  assert.equal(res.ok, false);
+  if (!res.ok) assert.match(res.error, /revised invoice/i);
+});
+
+test("validation: justifications must be substantive; bank verification needs reference and attestation", () => {
+  const r0 = asRun(BANK_CHANGE, run(BANK_CHANGE), "run-val");
+  for (const j of ["ok", "fine", "looks fine", "approved", "called vendor", "      "]) assert.equal(applyReviewAction(r0, { ...VERIFY, justification: j }).ok, false, `rejects "${j}"`);
+  assert.equal(applyReviewAction(r0, { ...VERIFY, verificationReference: "" }).ok, false, "reference required");
+  assert.equal(applyReviewAction(r0, { ...VERIFY, verificationReference: "  " }).ok, false, "blank reference");
+  assert.equal(applyReviewAction(r0, { ...VERIFY, verificationConfirmed: false }).ok, false, "attestation required");
+  const ok = applyReviewAction(r0, VERIFY);
+  assert.ok(ok.ok);
+  if (ok.ok) {
+    assert.match(ok.run.audit.at(-1)!.reference!, /Call 5 Nov 10:15, A\. Rao.*reviewer-attested/);
+    assert.equal(ok.run.audit.at(-1)!.attested, true);
+  }
+});
+
+test("validation: corrections need a substantive reason and a cited source", () => {
+  const i = inv({ ...HAPPY, tax: 90 });
+  const r0 = asRun(i, run(i), "run-src");
+  const base = { reviewer: "Priya", invoice: { tax: 98.8 } };
+  assert.equal(applyCorrections(r0, { ...base, reason: "fix", source: "page 1 total box" }, [r0]).ok, false, "weak reason");
+  assert.equal(applyCorrections(r0, { ...base, reason: "Tax is 98.80 on the printed invoice", source: "" }, [r0]).ok, false, "no source");
+  const ok = applyCorrections(r0, { ...base, reason: "Tax is 98.80 on the printed invoice", source: "page 1 totals box" }, [r0]);
+  assert.ok(ok.ok);
+  if (ok.ok) {
+    assert.match(ok.run.audit.at(-1)!.note!, /source: page 1 totals box/);
+    assert.equal(ok.run.originalInvoice?.tax, 90, "original extraction preserved");
+  }
+});
+
+test("safety: approve stays locked while a blocking finding is open, even after other resolutions", () => {
+  const r0 = asRun(BLUEPEAK, run(BLUEPEAK), "run-lock");
+  const v = applyReviewAction(r0, VERIFY);
+  assert.ok(v.ok);
+  if (!v.ok) return;
+  assert.equal(availableActions(v.run).find((a) => a.id === "approve")!.allowed, false);
+  assert.equal(applyReviewAction(v.run, { action: "approve", reviewer: "Priya", justification: "Everything has been checked by me" }).ok, false);
+});
+
+// ---------- pre-deployment regression pass ----------
+
+const RAO = inv({
+  vendor: "Rao Electricals",
+  invoiceNumber: "118",
+  lineItems: [
+    { description: "Panel rewiring Plant 2 labour", quantity: 1, unitPrice: 1850, total: 1850 },
+    { description: "Cable breakers fittings materials", quantity: 1, unitPrice: 640, total: 640 },
+  ],
+  subtotal: 2490,
+  tax: 199.2,
+  total: 2689.2,
+  documentType: "handwritten",
+});
+const GOOD_REASON = { reviewer: "Priya", reason: "Vendor confirmed the PO by email", source: "vendor email dated 5 Nov" };
+
+test("missing invoice number: Request clarification is the primary action, not a correction", () => {
+  const i = inv({ ...HAPPY, invoiceNumber: null });
+  const r = asRun(i, run(i), "run-nonum2");
+  assert.equal(requiredAction(r, openCodes(r)), "clarify");
+  const doc = deriveControls(r).find((c) => c.key === "document")!;
+  assert.equal(doc.status, "unresolved");
+  assert.equal(doc.action?.id, "request_info");
+  assert.match(doc.action!.label, /revised invoice/i);
+  assert.match(nextStep(r, openCodes(r)), /Request a revised invoice/);
+  assert.ok(availableActions(r).find((a) => a.id === "request_info")!.allowed);
+  assert.equal(availableActions(r).find((a) => a.id === "approve")!.allowed, false);
+});
+
+test("missing bank details: not shown as Passed/verified, policy unchanged (pays the account on file)", () => {
+  const none = inv({ ...HAPPY, bankAccount: null });
+  const r = asRun(none, run(none), "run-nobank");
+  assert.equal(r.decision.resolution, "AUTO_APPROVE", "business policy preserved: no printed account is not a mismatch");
+  const pay = deriveControls(r).find((c) => c.key === "payment")!;
+  assert.equal(pay.status, "passed", "does not block");
+  assert.equal(pay.caution?.label, "Not provided");
+  assert.match(pay.caution!.text, /nothing here was verified/);
+  assert.match(caseSummary(r).line, /not verified/);
+  assert.doesNotMatch(caseSummary(r).line, /bank match/);
+  // too few digits to compare
+  const short = inv({ ...HAPPY, bankAccount: "••12" });
+  assert.equal(deriveControls(asRun(short, run(short), "run-short")).find((c) => c.key === "payment")!.caution?.label, "Not verified");
+  // matching: no caution; conflicting: payment hold
+  const ok = deriveControls(asRun(HAPPY, run(HAPPY), "run-bank-ok")).find((c) => c.key === "payment")!;
+  assert.equal(ok.caution, undefined);
+  assert.equal(asRun(BANK_CHANGE, run(BANK_CHANGE), "run-bank-bad").status, "payment_hold");
+});
+
+test("PO selection: a reviewer-chosen PO stays unconfirmed and cannot silently clear the control", () => {
+  const r0 = asRun(RAO, run(RAO), "run-po-sel");
+  const res = applyCorrections(r0, { ...GOOD_REASON, invoice: { poReference: "PO-2026-0225" } }, [r0]);
+  assert.ok(res.ok);
+  if (!res.ok) return;
+  assert.equal(res.run.poMatch.method, "explicit");
+  assert.ok(res.run.findings.some((f) => f.code === "PO_MATCH_UNCONFIRMED" && f.action !== "info"), "still needs owner confirmation");
+  assert.ok(openCodes(res.run).includes("PO_MATCH_UNCONFIRMED"));
+  assert.equal(availableActions(res.run).find((a) => a.id === "approve")!.allowed, false);
+  assert.equal(res.run.audit.at(-1)!.kind, "reviewer");
+  assert.match(res.run.audit.at(-1)!.action, /re-ran all checks/);
+  // only the owner confirmation clears it, and that is recorded
+  const c = applyReviewAction(res.run, { action: "confirm_po", reviewer: "Priya", justification: "Plant manager confirmed PO-2026-0225 by phone" });
+  assert.ok(c.ok);
+  if (c.ok) assert.ok(!openCodes(c.run).includes("PO_MATCH_UNCONFIRMED"));
+});
+
+test("PO selection: an incompatible PO (other vendor) is fully revalidated and blocks, not accepted", () => {
+  const r0 = asRun(RAO, run(RAO), "run-po-bad");
+  const res = applyCorrections(r0, { ...GOOD_REASON, invoice: { poReference: "PO-2026-0184" } }, [r0]);
+  assert.ok(res.ok);
+  if (!res.ok) return;
+  assert.ok(res.run.findings.some((f) => f.code === "PO_VENDOR_MISMATCH"));
+  assert.equal(res.run.status, "payment_hold");
+  assert.equal(availableActions(res.run).find((a) => a.id === "approve")!.allowed, false);
+});
+
+test("duplicates are semantic: reformatted file and changed amount under the same invoice number are blocked", () => {
+  const original = asRun(HAPPY, run(HAPPY), "run-dup-orig");
+  const ledger = buildLedger(ERP_LEDGER, [original]);
+  const revised = inv({ ...HAPPY, lineItems: [{ description: "Hex bolt M8x40 (box of 100)", quantity: 25, unitPrice: 42, total: 1050 }], subtotal: 1050, tax: 84, shipping: 0, total: 1134 });
+  const r = run(revised, ledger, "different-file-hash", [{ runId: "run-dup-orig", fileHash: "h-new", createdAt: 1, status: "approved", invoiceNumber: "INV-1047" }]);
+  assert.ok(r.blocking.includes("DUPLICATE_INVOICE"), "same vendor + same number, new file and new amount");
+  assert.equal(r.decision.resolution, "REJECT");
+  assert.match(r.findings.find((f) => f.code === "DUPLICATE_INVOICE")!.detail, /amount differs/i);
+  assert.equal(asRun(revised, r, "run-dup-2").status, "rejected", "no second payable");
+  // formatting differences in the number do not evade it
+  const reformatted = inv({ ...HAPPY, invoiceNumber: "Invoice No. 01047" });
+  assert.ok(run(reformatted, ledger, "another-hash").blocking.includes("DUPLICATE_INVOICE"));
+});
+
+test("duplicates: the same invoice number from an unrelated vendor is not a duplicate", () => {
+  const original = asRun(HAPPY, run(HAPPY), "run-dup-orig2");
+  const ledger = buildLedger(ERP_LEDGER, [original]);
+  const other = inv({ ...BLUEPEAK, invoiceNumber: "INV-1047" });
+  const r = run(other, ledger, "hash-bp");
+  assert.ok(!r.codes.includes("DUPLICATE_INVOICE"));
+  assert.ok(!r.codes.includes("POSSIBLE_DUPLICATE"));
+});
+
+test("cumulative PO boundary: exactly at the ceiling passes, one cent over is flagged", () => {
+  const solvent = (total: number) => inv({ vendor: "Sunridge Chemicals Ltd.", invoiceNumber: "SC-4001", poReference: "PO-2026-0211", lineItems: [{ description: "Industrial solvent XR-4 (drum, 55gal)", quantity: 1, unitPrice: total, total }], subtotal: total, tax: 0, shipping: 0, total });
+  // PO 6,372.00 × 1.02 = 6,499.44 ceiling; 3,823.20 already billed
+  const at = run(solvent(2676.24));
+  assert.ok(!at.codes.includes("CUMULATIVE_PO_EXCEEDED"), "at the ceiling");
+  const over = run(solvent(2676.25));
+  assert.ok(over.blocking.includes("CUMULATIVE_PO_EXCEEDED"), "one cent over");
+});
+
+test("PO billing counts each eligible invoice once: approvals count, pending / duplicates / rejected do not", () => {
+  const a = { ...asRun(inv({ ...HAPPY, invoiceNumber: "INV-2001" }), run(inv({ ...HAPPY, invoiceNumber: "INV-2001" })), "run-c1"), status: "approved" as const };
+  const dupOfA = { ...asRun(inv({ ...HAPPY, invoiceNumber: "INV-2001" }), run(inv({ ...HAPPY, invoiceNumber: "INV-2001" }), buildLedger(ERP_LEDGER, [a]), "h2"), "run-c1-dup"), status: "rejected" as const };
+  const pending = { ...asRun(inv({ ...HAPPY, invoiceNumber: "INV-2002" }), run(inv({ ...HAPPY, invoiceNumber: "INV-2002" })), "run-c2"), status: "needs_review" as const };
+  const ledger = buildLedger(ERP_LEDGER, [a, dupOfA, pending]).filter((l) => l.poId === "PO-2026-0142");
+  assert.equal(ledger.filter((l) => l.invoiceNumber === "INV-2001").length, 1, "approved counted once, rejected duplicate excluded");
+  const next = inv({ ...HAPPY, invoiceNumber: "INV-2003" });
+  const billing = run(next, buildLedger(ERP_LEDGER, [a, dupOfA, pending])).poMatch.billing!;
+  assert.equal(billing.pendingInvoices.includes("INV-2002"), true);
+  assert.equal(billing.priorInvoices.includes("INV-2002"), false, "pending is not confirmed spend");
+  assert.equal(billing.priorInvoices.filter((n) => n === "INV-2001").length, 1);
+});
+
+test("stale state: approval is re-checked against the PO position when another invoice used it up first", () => {
+  const line = (q: number) => ({ description: 'PCB assembly rev 3.2 - "Orion"', quantity: q, unitPrice: 87.5, total: q * 87.5 });
+  const A = inv({ vendor: "Bluepeak Components Inc.", invoiceNumber: "BP-A", poReference: "PO-2026-0184", lineItems: [line(60)], subtotal: 5250, tax: 420, shipping: 120, total: 5790, bankAccount: "5550 1234 7777" });
+  const B = inv({ vendor: "Bluepeak Components Inc.", invoiceNumber: "BP-B", poReference: "PO-2026-0184", lineItems: [line(45)], subtotal: 3937.5, tax: 315, shipping: 0, total: 4252.5 });
+  const a0 = asRun(A, run(A), "run-A"); // bank change → on hold, pending (not counted yet)
+  assert.equal(a0.status, "payment_hold");
+  const b = { ...asRun(B, run(B, buildLedger(ERP_LEDGER, [a0]), "hb"), "run-B"), status: "approved" as const }; // B gets approved first
+  const verified = applyReviewAction(a0, VERIFY);
+  assert.ok(verified.ok);
+  if (!verified.ok) return;
+  assert.equal(verified.run.findings.some((f) => f.code === "CUMULATIVE_PO_EXCEEDED"), false, "A was fine when it was processed");
+  const refreshed = refreshStale(verified.run, [verified.run, b]);
+  assert.ok(refreshed, "stale position detected");
+  assert.ok(refreshed!.findings.some((f) => f.code === "CUMULATIVE_PO_EXCEEDED" && f.action !== "info"));
+  assert.equal(refreshed!.findings.length > verified.run.findings.length, true, "originals kept, new finding added");
+  assert.equal(refreshed!.audit.length, verified.run.audit.length + 1, "audit appended, never rewritten");
+  assert.equal(refreshed!.audit.at(-1)!.kind, "system");
+  assert.equal(availableActions(refreshed!).find((x) => x.id === "approve")!.allowed, false, "approval is blocked until it is authorised");
+  // a competing PENDING invoice alone must not block (whoever is approved first is legitimate)
+  assert.equal(refreshStale(verified.run, [verified.run, { ...b, status: "needs_review" as const }]), null);
+});
+
+test("reviewer state transitions: awaiting vendor, hold, and closed states behave", () => {
+  const r = asRun(BANK_CHANGE, run(BANK_CHANGE), "run-trans");
+  const asked = applyReviewAction(r, { action: "request_info", reviewer: "Priya", justification: "Asked the vendor to confirm the new account" });
+  assert.ok(asked.ok);
+  if (!asked.ok) return;
+  assert.equal(asked.run.status, "awaiting_info");
+  assert.equal(applyReviewAction(asked.run, { action: "request_info", reviewer: "Priya", justification: "Asked the vendor again today" }).ok, false, "cannot request twice");
+  assert.equal(applyReviewAction(asked.run, { action: "approve", reviewer: "Priya", justification: "Everything was checked by me" }).ok, false, "still blocked while waiting");
+  const verified = applyReviewAction(asked.run, VERIFY);
+  assert.ok(verified.ok, "a call-back can still be recorded while waiting");
+  if (!verified.ok) return;
+  assert.equal(caseSummary(verified.run).title.startsWith("Verification recorded"), true);
+  const done = applyReviewAction(verified.run, { action: "approve", reviewer: "Priya", justification: "Call-back recorded and all controls resolved" });
+  assert.ok(done.ok && done.run.status === "approved");
+  if (done.ok) assert.equal(availableActions(done.run).length, 0, "closed");
+});
+
+test("audit: attested verification and PO authorisation keep identity, reference, justification and original findings", () => {
+  const r0 = asRun(BLUEPEAK, run(BLUEPEAK), "run-audit");
+  const originalCodes = r0.findings.map((f) => f.code);
+  const v = applyReviewAction(r0, VERIFY);
+  assert.ok(v.ok);
+  if (!v.ok) return;
+  const po = applyReviewAction(v.run, { action: "resolve_po", reviewer: "Sam", justification: "Owner approved the price change in writing", authorizedBy: "a.patel", reference: "AMD-77" });
+  assert.ok(po.ok);
+  if (!po.ok) return;
+  const [, e1, e2] = po.run.audit;
+  assert.equal(e1.actor, "Priya");
+  assert.match(e1.reference!, /Call 5 Nov 10:15, A\. Rao/);
+  assert.equal(e1.attested, true);
+  assert.equal(e1.note, VERIFY.justification);
+  assert.equal(e2.actor, "Sam");
+  assert.match(e2.reference!, /a\.patel.*AMD-77/);
+  assert.equal(e2.note, "Owner approved the price change in writing");
+  assert.deepEqual(po.run.findings.map((f) => f.code), originalCodes, "original findings untouched");
+  assert.match(e1.action, /attested/i);
+  assert.doesNotMatch(JSON.stringify(po.run.audit), /Verified payment details by independent call-back/);
+});
+
+test("analytics: unique invoices, repeat uploads, STP, awaiting and exposure share one set of definitions", () => {
+  const ok = asRun(HAPPY, run(HAPPY), "m-ok"); // auto-approved
+  const repeat = { ...asRun(HAPPY, run(HAPPY, buildLedger(ERP_LEDGER, [ok]), "m-h2"), "m-repeat"), repeatSubmission: true }; // re-upload of the same invoice
+  const open = asRun(BANK_CHANGE, run(BANK_CHANGE), "m-open"); // on hold, $3,272
+  const m = computeMetrics([ok, repeat, open]);
+  assert.equal(m.attempts, 3);
+  assert.equal(m.cases, 2, "the repeat is not a new invoice");
+  assert.equal(m.repeatAttempts, 1);
+  assert.equal(m.eligible, 2, "repeat of an invoice already on file is not eligible");
+  assert.equal(m.autoApproved, 1);
+  assert.equal(m.stpRate, 0.5);
+  assert.equal(m.awaiting, 1);
+  assert.equal(m.holds, 1);
+  assert.equal(m.valueRequiringIntervention, 3272);
+  assert.deepEqual(m.byStatus, { approved: 1, needs_review: 0, payment_hold: 1, rejected: 0 });
 });

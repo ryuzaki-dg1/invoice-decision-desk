@@ -2,13 +2,25 @@
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { forwardChat, forwardChatStream, getHealth } from "./proxy.ts";
+import { challenge, isAuthorised, resetEnabled } from "./access.ts";
 import { actOnRun, addRun, clearRuns, correctRun, listRuns, readPreview } from "./store.ts";
+
+const MAX_BODY = 25 * 1024 * 1024; // page images are the largest legitimate payload
 
 async function readJson(req: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
-  for await (const chunk of req) chunks.push(chunk as Buffer);
+  let size = 0;
+  for await (const chunk of req) {
+    size += (chunk as Buffer).length;
+    if (size > MAX_BODY) throw Object.assign(new Error("Request too large"), { status: 413 });
+    chunks.push(chunk as Buffer);
+  }
   const raw = Buffer.concat(chunks).toString("utf8");
-  return raw ? JSON.parse(raw) : {};
+  try {
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    throw Object.assign(new Error("Invalid JSON"), { status: 400 });
+  }
 }
 
 function sendJson(res: ServerResponse, status: number, payload: unknown): void {
@@ -23,8 +35,15 @@ export async function handleApi(req: IncomingMessage, res: ServerResponse): Prom
   if (!url.startsWith("/api/")) return false;
   try {
     if (url === "/api/health" && req.method === "GET") {
-      sendJson(res, 200, getHealth());
-    } else if (url === "/api/chat" && req.method === "POST") {
+      // Unauthenticated callers (platform health checks) learn only that the server is up.
+      sendJson(res, 200, isAuthorised(req) ? getHealth() : { status: "ok" });
+      return true;
+    }
+    if (!isAuthorised(req)) {
+      challenge(res);
+      return true;
+    }
+    if (url === "/api/chat" && req.method === "POST") {
       const result = await forwardChat(await readJson(req));
       res.statusCode = result.status;
       res.setHeader("Content-Type", result.contentType);
@@ -54,8 +73,11 @@ export async function handleApi(req: IncomingMessage, res: ServerResponse): Prom
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       sendJson(res, 201, await addRun((await readJson(req)) as any));
     } else if (url === "/api/runs" && req.method === "DELETE") {
-      await clearRuns();
-      sendJson(res, 200, { ok: true });
+      if (!resetEnabled()) sendJson(res, 403, { error: "Reset is disabled on this deployment (set ENABLE_RESET=true to allow it)." });
+      else {
+        await clearRuns();
+        sendJson(res, 200, { ok: true });
+      }
     } else if (/^\/api\/runs\/[^/]+\/preview$/.test(url) && req.method === "GET") {
       const doc = await readPreview(decodeURIComponent(url.split("/")[3]));
       if (!doc) sendJson(res, 404, { error: "no preview" });
@@ -78,7 +100,8 @@ export async function handleApi(req: IncomingMessage, res: ServerResponse): Prom
       sendJson(res, 404, { error: "not found" });
     }
   } catch (err) {
-    if (!res.headersSent) sendJson(res, 500, { error: (err as Error).message });
+    const status = (err as { status?: number }).status ?? 500;
+    if (!res.headersSent) sendJson(res, status, { error: (err as Error).message });
     else res.end();
   }
   return true;

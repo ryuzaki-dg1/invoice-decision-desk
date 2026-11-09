@@ -11,6 +11,8 @@ An exception-first accounts-payable workspace. It takes a vendor invoice (digita
 - A vision model extracts the fields. Every check after that is plain code with a named threshold, so the same invoice always gets the same decision and each decision cites the rule codes that produced it.
 - The model then writes a plain-English summary and a vendor email draft. It is told the decision and cannot change it. If the model is unavailable, a template explanation is used and the decision is unaffected.
 - Reviewer actions are enforced on the server with the same rules the UI uses, so no button can bypass an open control.
+- The server does not trust the browser's decision. When a new run is saved it re-runs every deterministic check (vendor, bank, PO, cumulative billing, duplicates) against the current store, discards any client-supplied status, resolutions or audit events, and writes its own. Writes are serialised, so two simultaneous uploads or a retry cannot both pass the duplicate / PO checks.
+- Before an approval is attempted, the checks are re-run against the current PO position. If another invoice has since used the PO, the new finding is added to the case (the original findings, decision and audit are untouched) and approval is refused until it is resolved.
 
 ## Decision policy (strictest finding wins; all findings are kept)
 
@@ -27,7 +29,9 @@ Key rules:
 - **PO value:** cumulative *confirmed* billing (paid in ERP or approved here) plus this invoice is compared against PO value × (1 + 2%). Split invoicing passes while the running total fits. Invoices still in review or on hold are not counted as spend; if they would push the PO over, `PENDING_PO_CONFLICT` sends this one to review.
 - **One percentage format** everywhere (2 decimals): $486 / $9,570 → +5.08%. The AI explanation must quote figures from the findings, not compute its own.
 - **Inferred PO:** shown as a *suggested* match (`PO_MATCH_UNCONFIRMED`) that a reviewer must confirm.
-- **Duplicates:** conservative invoice-number normalisation (case, spaces, punctuation, a leading "INV"/"Invoice No" label, leading zeros), scoped to the same vendor. Same amount with a different number is only a *possible* duplicate. A byte-identical re-upload is recorded as a repeat submission and never adds a payable.
+- **Duplicates:** conservative invoice-number normalisation (case, spaces, punctuation, a leading "INV"/"Invoice No" label, leading zeros), scoped to the same vendor. Identity is vendor + invoice number, not the file, so a reformatted PDF or a changed amount under the same number is still a duplicate/conflict and is rejected with a note that the amount differs, never paid as a second payable. The same number from an unrelated vendor is not a duplicate. Same amount with a different number is only a *possible* duplicate. A byte-identical re-upload is recorded as a repeat submission and never adds a payable.
+- **Missing and unverifiable payment details:** matching account = Passed; account differs = payment hold; **no account printed (or too few digits to compare) = "Not provided / Not verified"**. The policy is unchanged (payment would go to the account on file, so it does not block approval), but the app never shows it as verified.
+- **Missing invoice number:** the primary action is **Request clarification** (a revised invoice from the vendor). The number cannot be typed in by a reviewer; other missing fields can only be corrected with a cited source.
 - **Approved ≠ paid:** "paid" is only said when the ERP history has a payment record (seeded demo data). Invoices approved here are "approved for payment, not yet paid".
 
 ## Understand → Control → Resolve
@@ -38,6 +42,7 @@ Key rules:
 - **Invoice checks vs payment readiness:** an invoice can be valid (arithmetic and PO pass) and still unsafe to pay (changed bank account). Two derived indicators show this:
   - Invoice checks: Passed / Exceptions found / Incomplete
   - Payment readiness: Ready / Awaiting verification / Awaiting approval / Blocked / Closed
+  - Both, and the summary text, are derived from the **current** state (what is open and resolved now); the original rule outcome, findings and audit are kept as history.
 
   "Ready" means approved for the payment run, never "paid".
 - **Document-to-data verification:** for digital PDFs, the app stores the real page-1 positions of every text run from the PDF text layer. Clicking an extracted value (vendor, invoice no., date, PO, account, subtotal, tax, freight, total, line amounts) highlights it on the original. Scans and photos have no text layer, so the app says so instead of drawing a guessed box.
@@ -60,17 +65,17 @@ Key rules:
 
 | Open control | Required resolution |
 |---|---|
-| Bank account mismatch | **Verify payment details**: confirm an independent call-back to the contact on file. Clears only the security hold. |
+| Bank account mismatch | **Verify payment details**: the reviewer attests they called the contact on file, and records a verification reference. This is a manual attestation; the app does not verify the call. Clears only the security hold. |
 | PO overage / quantity / price / expiry | **Resolve PO discrepancy**: record who authorised the amendment and its reference. The PO record isn't silently changed. A corrected invoice goes through "Correct extracted fields" instead. |
 | Suggested PO | **Confirm suggested PO** |
 | Handwritten / uncertain read | **Confirm extracted information**. It does not approve. |
-| Arithmetic / missing fields / no PO | **Correct extracted fields**: the server re-runs every rule |
+| Arithmetic / missing fields / no PO | **Correct extracted fields** with a specific reason and a cited source; the server re-runs every rule. A missing invoice number is not correctable: request a revised invoice |
 | Unknown vendor | Cannot be approved here: request onboarding (awaiting vendor), keep on hold, or reject |
 | Possible duplicate / above limit | Approve with justification |
 
 Every finding has a stable code, a severity, evidence and an open/resolved state. Resolving one finding recomputes the status from what remains. **Approve unlocks only when nothing material is open**, and approval is a separate, explicit step. Each reviewer event records the action, demo identity, time, justification, the findings it resolved, the findings still open, and any authorisation reference. Closed cases accept no further actions.
 
-Every status change requires a reviewer name (lightweight demo identity) and a justification, and is logged with the from/to status and timestamp. Approved and rejected cases are final.
+Every status change requires a reviewer name (lightweight demo identity) and a specific justification (at least 15 characters, not a stock phrase like "looks fine"), and is logged with the from/to status and timestamp. Approved and rejected cases are final.
 
 ## Handwritten / uncertain documents: correct and re-validate
 
@@ -80,7 +85,7 @@ Every status change requires a reviewer name (lightweight demo identity) and a j
 4. Saving sends the corrected invoice to the server, which **re-runs every deterministic check** (arithmetic, vendor, PO, cumulative billing, quantity, price, duplicates) with the run's own policy snapshot. The result can go up or down; a correction that creates a duplicate is rejected.
 5. The audit keeps the original extraction and records each change (field, from → to), reviewer, time and reason. Earlier PO and figure confirmations are cleared, because the data changed.
 6. Approval stays locked while the invoice doesn't reconcile or is missing fields, and until the reviewer confirms the figures and any suggested PO. A clean result after a correction still needs an explicit approval.
-7. With no PO printed, ranked **PO suggestions** show their reasons (same vendor, amount fit, matching lines). Applying one is a recorded correction, never a silent match.
+7. With no PO printed, ranked **PO suggestions** show their reasons (same vendor, amount fit, matching lines). Weak matches (low amount fit, no matching lines, or over the open value) are collapsed under "Weak matches" with the reason they don't fit. Applying one is a recorded correction that re-runs every rule, and a PO the reviewer chose stays *unconfirmed* until the PO owner confirms it, so selecting a PO never silently clears the PO control.
 
 Demo file `04-rao-handwritten-no-po.jpg` has a genuinely ambiguous labour amount: an 8 written over a 3. In the latest live test Gemini read it correctly as 1850 and did not flag it; the case still went to review (handwritten + suggested PO). Nothing about the model output is hardcoded.
 
@@ -91,13 +96,24 @@ Each page answers one question:
 - **Overview:** *What needs attention today?* A priority queue ordered by a transparent rule (severity, then amount at stake, then time waiting, with the reason shown), compact metrics, decision mix, frequent exceptions, recent activity.
 - **Process Invoice:** *Can this invoice be processed safely?* Three states: intake, then live processing (document + 8-stage timeline; business-rule blocks are distinct from system errors), then the investigation workspace.
 - **Review Queue:** *What should I do next?* Master-detail, grouped by the action needed (Verify bank details, Onboard vendor, Correct or confirm fields, Confirm PO, Resolve PO discrepancy…), with the selected case resolvable in place.
-- **Invoice detail:** *Why was this decided?* Document on the left (zoom, open original); decision, required action, evidence comparisons, field review/correction, resolution on the right. **Decision view** (default) shows only what's needed to act; **Detailed view** adds every rule finding, all evidence, vendor email, processing log and audit trail. The decision is the same in both.
+- **Invoice detail:** *Why was this decided?* Document on the left (zoom, open original); decision, required action, evidence comparisons, field review/correction, resolution on the right. **Summary** (default) shows the decision, a one-sentence reason, payment readiness and the next action, with the blocking evidence open and the rest collapsed; **Detailed** adds rule codes, every control description, all rule findings, supporting evidence, vendor email, processing log and audit trail. The decision is the same in both. Every section is expandable.
 - **Invoice History** · **Reference Data** (tabs + search; confirmed billing (paid or approved) shown separately from pending invoices) · **Policy Rules** (grouped thresholds, fixed security controls, decision precedence, and an **impact preview** that re-runs the rules on stored invoices to show which decisions a threshold change would alter).
 
 Metric definitions:
 - **Straight-through rate:** auto-approved ÷ processed, excluding repeat submissions.
 - **Awaiting review:** needs review + payment hold + awaiting vendor.
 - **Value requiring intervention:** the sum of those open invoices.
+
+## The four designed edge cases
+
+| Case | Sample | Behaviour |
+|---|---|---|
+| Split billing against one PO | `02-sunridge-split-overbilling.pdf` | Cumulative billing over the PO needs review; confirmed spend is counted once |
+| Scanned resubmission of a paid invoice | `03-northstar-duplicate-scan.pdf` | Matched by vendor + normalised number, rejected as "Duplicate blocked" |
+| Handwritten invoice with no PO | `04-rao-handwritten-no-po.jpg` | Review: figures confirmed or corrected, PO suggested and owner-confirmed |
+| Changed bank details | `05-acme-bank-change.pdf` | Payment hold until a call-back is attested; approval stays separate |
+
+`01` (clean) and `06` (unknown vendor, payment hold) complete the demo set below.
 
 ## Demo inputs (`app/public/samples`)
 
@@ -118,12 +134,33 @@ Reference data lives in `app/src/data/`. Regenerate the samples with `npm run ma
 cd app
 npm install
 cp .env.example .env   # add one key: GEMINI_API_KEY (free tier works), OPENAI_API_KEY or OPENROUTER_API_KEY
-npm run dev            # http://localhost:5173
+npm run dev            # development: http://localhost:5173
+# or production mode (what the Docker image runs):
+npm run build && npm start   # http://localhost:3000 (set PORT to change)
 ```
+
+Needs Node 22.6 or newer. On Windows PowerShell, if `npm` is blocked by the execution policy, use `npm.cmd` instead.
+
+### Environment variables
+
+Set them in `app/.env` (local only, never commit it) or in the host's environment. No secrets are stored in the repository.
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `GEMINI_API_KEY` / `OPENAI_API_KEY` / `OPENROUTER_API_KEY` | One of them | Document extraction and the AI summary. First one found wins. Without one, upload fails with a clear system error; stored cases still open. |
+| `LLM_MODEL` | No | Comma-separated model list: primary, then fallbacks used on 429/503 |
+| `LLM_REASONING_EFFORT` | No | Gemini reasoning effort (default `low`) |
+| `DATA_DIR` | No | Where `runs.json` and page previews are stored (default `./data`). Mount a volume here in production. |
+| `PORT` | No | HTTP port (default `3000`) |
+| `HTTPS_PROXY` | No | Outbound proxy for model calls, if the host needs one |
+| `DEMO_ACCESS_KEY` | **Yes in production** | Server-enforced access key (12+ chars). Every route except a bare `/api/health` needs it; the browser shows a sign-in prompt (any username, key as password). Never placed in the frontend bundle. Without it the production server refuses to start. |
+| `ENABLE_RESET` | No | Set `true` to allow "Reset demo data" in production (disabled by default there; always allowed in local dev) |
+| `ALLOW_OPEN_ACCESS` | No | `true` lets production start with no access key. Not recommended. |
+| `HOST` | No | Bind address. Unset = all interfaces |
 
 ## Testing
 
-- `npm test` runs 36 tests: decision engine, multi-finding review rules, correction loop, analytics, control checklist, duplicate semantics, PO accounting, the locator and AI-failure handling: every scenario plus arithmetic, discounts, approved-vs-paid wording, repeat uploads, possible duplicates and reviewer controls. No API calls are made.
+- `npm test` runs 63 tests, with no API calls: decision engine, multi-finding review rules, correction loop, analytics, control checklist, duplicate semantics (reformatted file, changed amount, unrelated vendor), cumulative-PO boundaries, PO accounting, current-state messaging, reviewer validation and state transitions, the audit trail, plus server tests (forged client records are re-decided, concurrent uploads and retries create one payable, stale PO position blocks approval).
 - `node scripts/e2e.mjs` drives the real UI in Edge through all six invoices with the live model, then a repeat upload and the bank-verification review flow, and saves screenshots. It clears run history first. `--ui-only` reuses stored runs to save model quota.
 
 ## Deploy
@@ -134,13 +171,16 @@ docker build -t invoice-desk .
 docker run -p 3000:3000 -e GEMINI_API_KEY=... invoice-desk
 ```
 
-Runs are stored in `DATA_DIR` (default `./data`): `runs.json` plus page previews in `docs/`. Attach a volume to keep them across deploys.
+Runs are stored in `DATA_DIR` (default `./data`): `runs.json` plus page previews in `docs/`. Attach a volume to keep them across deploys. The container listens on `PORT` (3000) and exposes `/api/health` for health checks (`railway.toml`). `.dockerignore` keeps `.env`, `node_modules` and local data out of the image.
+
+**Before exposing it publicly:** set `DEMO_ACCESS_KEY` (a shared demo key, not per-user login; see limits below) and mount a persistent volume at `DATA_DIR` (for example `DATA_DIR=/data`). Policy thresholds are fixed on the server; the Policy page only previews the effect of changes.
 
 ## Assumptions and limits
 
 - One company, USD, 2-way match (invoice ↔ PO). Goods receipts (3-way match) would slot into the PO stage.
 - The PO table, vendor master and ERP payment history are static demo files standing in for an ERP. Run history is a JSON file. Production would use the ERP API and a database.
-- Policy thresholds are stored per browser. Reviewer identity is a typed name, not authentication.
+- Policy thresholds are fixed on the server (`DEFAULT_RULES`); anything a browser sends is ignored. Changing them means editing `policy.ts` and redeploying. Reviewer identity is a typed name, not authentication. The only access control is one shared `DEMO_ACCESS_KEY` (HTTP Basic, no rate limiting, no per-user accounts), so anyone holding the key can act as any reviewer. Use a long random key and serve over HTTPS (the key is sent on every request); for real use put it behind SSO or a private network.
+- Bank verification and PO authorisation are reviewer attestations (name, reference, justification, time). The app does not contact the vendor or the PO owner and never claims to have verified them.
 - Invoices arrive by upload; an email inbox listener would call the same pipeline. Up to 3 pages per invoice are sent to the model.
 - Low-confidence fields are the model's self-report, not a calibrated score. No source-position highlighting on the page image.
 - Model: Gemini 3.5 Flash with automatic retry and fallback (`gemini-3.8-flash`, `gemini-flash-latest`, `gemini-3.5-flash-lite`) on 429/503. The free tier rate-limits heavily, so expect 10–60 s per invoice when it is busy.

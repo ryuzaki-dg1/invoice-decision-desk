@@ -11,7 +11,7 @@ import { buildLedger, money } from "../lib/engine";
 import { openCases } from "../lib/analytics";
 import { checkHealth } from "../lib/llm";
 import { STAGES, runPipeline } from "../lib/pipeline";
-import { loadRules } from "../lib/rules";
+import { DEFAULT_RULES } from "../lib/rules";
 import { fetchRuns, saveRun } from "../lib/runsApi";
 import { Timeline } from "../runView";
 import { Shell } from "../Shell";
@@ -100,7 +100,7 @@ export default function Process() {
           purchaseOrders: PURCHASE_ORDERS,
           ledger: buildLedger(ERP_LEDGER, history),
           priorSubmissions: history.map((r) => ({ runId: r.id, fileHash: r.fileHash, createdAt: r.createdAt, status: r.status, invoiceNumber: r.invoice.invoiceNumber })),
-          rules: loadRules(),
+          rules: DEFAULT_RULES, // the server re-decides with its own thresholds
           today: new Date().toISOString().slice(0, 10),
           model: `${health.provider}/${health.model}`,
         },

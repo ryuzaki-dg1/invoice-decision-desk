@@ -95,13 +95,13 @@ export default function Policy() {
       <header className="page-head">
         <div>
           <h1 className="h1">Policy rules</h1>
-          <p className="sub">The deterministic controls that decide every invoice. The AI reads and explains; these rules decide.</p>
+          <p className="sub">The deterministic controls that decide every invoice. The AI reads and explains; these rules decide. Thresholds are fixed by the server: changes here only preview the impact on stored invoices and do not alter decisions.</p>
         </div>
         <div className="actions">
           <button className="btn" onClick={() => setRules(DEFAULT_RULES)} disabled={JSON.stringify(rules) === JSON.stringify(DEFAULT_RULES)}>
             <RotateCcw size={15} /> Reset to defaults
           </button>
-          <button className="btn btn-primary" disabled={!dirty} onClick={() => (setSaved(rules), notify("Policy saved · applies to new invoices"))}>
+          <button className="btn btn-primary" disabled={!dirty} onClick={() => (setSaved(rules), notify("Preview saved in this browser · server thresholds unchanged"))}>
             <Save size={15} /> Save changes
           </button>
         </div>

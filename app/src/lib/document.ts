@@ -35,6 +35,8 @@ async function sha256(buf: ArrayBuffer): Promise<string> {
   return [...new Uint8Array(hash)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+export const DAMAGED_PDF = "This PDF is damaged or unreadable. Please upload a valid PDF.";
+
 export async function prepareDocument(file: File): Promise<PreparedDocument> {
   const isPdf = file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
   const bytes = await file.arrayBuffer();
@@ -52,7 +54,12 @@ export async function prepareDocument(file: File): Promise<PreparedDocument> {
     };
   }
 
-  const pdf = await pdfjs.getDocument({ data: new Uint8Array(bytes) }).promise;
+  let pdf: Awaited<ReturnType<typeof pdfjs.getDocument>["promise"]>;
+  try {
+    pdf = await pdfjs.getDocument({ data: new Uint8Array(bytes) }).promise;
+  } catch {
+    throw new Error(DAMAGED_PDF);
+  }
   const pages = Math.min(pdf.numPages, MAX_PAGES);
   const images: string[] = [];
   const texts: string[] = [];

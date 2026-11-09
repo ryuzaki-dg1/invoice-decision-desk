@@ -112,6 +112,24 @@ function finding(stage: StageId, code: ExceptionCode, action: CheckAction, title
   return { stage, code, action, title, detail, evidence };
 }
 
+// A PO a reviewer selected (it was not printed on the invoice) is a lead, not
+// proof the spend was authorised. It stays unconfirmed until the PO owner
+// confirms it, so choosing a PO never silently clears the PO control.
+export function assignedPoFinding(po: PurchaseOrder): Finding {
+  return finding(
+    "po_match",
+    "PO_MATCH_UNCONFIRMED",
+    "review",
+    `PO ${po.id} was selected by a reviewer`,
+    `${po.id} is not the PO printed on the invoice; a reviewer selected it. A selection is not proof the spend was authorised: confirm with the PO owner (${po.approvedBy}) before approving.`,
+    [
+      { label: "PO printed on invoice", value: "not this PO", tone: "bad" },
+      { label: "PO selected by reviewer", value: `${po.id} · ${money(po.total, po.currency)}` },
+      { label: "PO owner", value: po.approvedBy },
+    ],
+  );
+}
+
 // ---------- Stage: validate ----------
 
 export function expectedTotal(inv: Invoice): number | null {
@@ -648,7 +666,7 @@ export function checkDuplicates(
         "DUPLICATE_INVOICE",
         "reject",
         `Duplicate of ${exact.invoiceNumber}`,
-        `Same vendor and same invoice number as ${exact.invoiceNumber} (${money(exact.total, inv.currency)}, dated ${exact.issueDate}), which is ${describeLedgerStatus(exact.status)}.${printedDiffers ? ` Printed here as "${inv.invoiceNumber}", which normalises to the same number.` : ""} Processing it again would create a second payable for the same bill.`,
+        `Same vendor and same invoice number as ${exact.invoiceNumber} (${money(exact.total, inv.currency)}, dated ${exact.issueDate}), which is ${describeLedgerStatus(exact.status)}.${printedDiffers ? ` Printed here as "${inv.invoiceNumber}", which normalises to the same number.` : ""} ${Math.abs(exact.total - (inv.total ?? exact.total)) >= 0.01 ? ` The amount differs (${money(inv.total, inv.currency)} here vs ${money(exact.total, inv.currency)} on file): a changed amount under the same invoice number is a revised or conflicting invoice and is not paid as a second payable. Ask the vendor to confirm which one is valid.` : ""} Processing it again would create a second payable for the same bill.`,
         [
           { label: "This submission", value: `${inv.invoiceNumber ?? "—"} · ${money(inv.total, inv.currency)}` },
           { label: "Original on file", value: `${exact.invoiceNumber} · ${money(exact.total, inv.currency)} · ${exact.issueDate}` },
@@ -693,8 +711,13 @@ function reviewAction(code: ExceptionCode, inv: Invoice, vendor: Vendor | null, 
   const b = pm?.billing;
   const who = vendor?.name ?? inv.vendor;
   switch (code) {
-    case "CUMULATIVE_PO_EXCEEDED":
-      return po && b ? `Ask ${who} for a corrected invoice for the ${money(Math.max(0, b.poTotal - b.previouslyBilled), po.currency)} still open on ${po.id}, or have ${po.approvedBy} increase the PO.` : null;
+    case "CUMULATIVE_PO_EXCEEDED": {
+      if (!po || !b) return null;
+      const left = b.poTotal - b.previouslyBilled;
+      return left > 0.005
+        ? `Ask ${who} for a corrected invoice for the ${money(left, po.currency)} still open on ${po.id}, or have ${po.approvedBy} authorise a PO amendment.`
+        : `${po.id} is already fully billed. Ask ${po.approvedBy} to authorise a PO amendment for the extra amount, or request a corrected invoice from ${who}.`;
+    }
     case "PO_AMOUNT_EXCEEDED":
       return po && b ? `Confirm the extra ${money(b.billedAfter - b.poTotal, po.currency)} with ${po.approvedBy} or request a corrected invoice.` : null;
     case "QUANTITY_EXCEEDS_PO":
@@ -709,7 +732,7 @@ function reviewAction(code: ExceptionCode, inv: Invoice, vendor: Vendor | null, 
     case "ARITHMETIC_MISMATCH":
       return `Ask ${who} for a corrected invoice; do not pay the printed total until it reconciles.`;
     case "MISSING_FIELD":
-      return `Request a complete invoice from ${who}.`;
+      return inv.invoiceNumber ? `Request a complete invoice from ${who}.` : `Invoice number is missing. Request a revised invoice from ${who}; do not enter a number manually.`;
     case "EXPIRED_PO":
       return po ? `Ask ${po.approvedBy} to re-authorise ${po.id}.` : null;
     case "POSSIBLE_DUPLICATE":

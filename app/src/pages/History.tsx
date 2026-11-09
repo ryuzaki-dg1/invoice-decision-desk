@@ -24,9 +24,13 @@ export default function History() {
           className="btn"
           onClick={async () => {
             if (!confirm("Clear all processed invoices, corrections and reviewer actions? Seeded ERP history (demo data) stays.")) return;
-            await resetRuns();
-            await reload();
-            notify("Demo data reset");
+            try {
+              await resetRuns();
+              await reload();
+              notify("Demo data reset");
+            } catch (e) {
+              notify(e instanceof Error ? e.message : "Could not reset");
+            }
           }}
         >
           <RotateCcw size={15} /> Reset demo data

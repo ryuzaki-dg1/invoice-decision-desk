@@ -3,16 +3,17 @@
 // workspace without the document pane (document opens in a viewer instead).
 
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { ArrowRight, Ban, BadgeCheck, Check, CircleDashed, ClipboardCheck, ExternalLink, FileSearch, History, Landmark, Lock, MapPin, MessageSquareText, PauseCircle, PencilLine, ShieldCheck, TriangleAlert, X, ZoomIn, ZoomOut } from "lucide-react";
+import { ArrowRight, Ban, ChevronDown, BadgeCheck, Check, CircleDashed, ClipboardCheck, ExternalLink, FileSearch, History, Landmark, Lock, MapPin, MessageSquareText, PauseCircle, PencilLine, ShieldCheck, TriangleAlert, X, ZoomIn, ZoomOut } from "lucide-react";
 import { attemptKind, deriveControls, invoiceChecks, paymentReadiness, PASS_TEXT, type ControlAction } from "./lib/controls";
 import { locate, type LocateKind } from "./lib/locate";
-import { REASON_LABEL, SHORT, nextStep, requiredAction } from "./copy";
+import { REASON_LABEL, SHORT, requiredAction } from "./copy";
 import { PURCHASE_ORDERS } from "./data/purchaseOrders";
 import { ERP_LEDGER, VENDORS } from "./data/vendors";
 import { EvidenceStack } from "./evidence";
 import { buildLedger, expectedTotal, isOpen, money, statusLabel, suggestPos } from "./lib/engine";
 import { DEFAULT_RULES } from "./lib/rules";
-import { NEEDS_CORRECTION, availableActions, openCodes, type ActionOption, type ReviewActionId } from "./lib/review";
+import { caseSummary } from "./lib/status";
+import { NEEDS_CORRECTION, availableActions, justificationError, openCodes, type ActionOption, type ReviewActionId } from "./lib/review";
 import { submitCorrection, submitReview } from "./lib/runsApi";
 import { AuditTrail, Findings, Timeline, VendorComms, decidedBy } from "./runView";
 import type { Invoice, RunRecord, TextBox } from "./types";
@@ -104,6 +105,37 @@ export function locateField(run: RunRecord, label: string, kind: LocateKind, val
 
 // ---------------- Fields: review + correction ----------------
 
+// Every panel in the result column is an expandable section. `defaultOpen`
+// sets the starting state; the reviewer can always toggle it.
+function reveal(el: Element | null) {
+  for (let n: Element | null = el; n; n = n.parentElement) if (n instanceof HTMLDetailsElement) n.open = true;
+}
+function goTo(id: string, block: ScrollLogicalPosition = "start") {
+  const el = document.getElementById(id);
+  if (!el) return;
+  reveal(el);
+  el.scrollIntoView({ behavior: "smooth", block });
+}
+function Section({ id, title, meta, action, defaultOpen = true, children }: { id?: string; title: ReactNode; meta?: ReactNode; action?: ReactNode; defaultOpen?: boolean; children: ReactNode }) {
+  return (
+    <section className="sec sec-x" id={id}>
+      <details open={defaultOpen}>
+        <summary>
+          <h3>{title}</h3>
+          {meta != null && <span className="sec-meta">{meta}</span>}
+          {action && (
+            <span className="sec-act" onClick={(e) => e.preventDefault()}>
+              {action}
+            </span>
+          )}
+          <ChevronDown size={16} className="acc-chev" aria-hidden />
+        </summary>
+        <div className="sec-body">{children}</div>
+      </details>
+    </section>
+  );
+}
+
 type Draft = { invoiceNumber: string; issueDate: string; poReference: string; subtotal: string; tax: string; shipping: string; discount: string; total: string; lines: { quantity: string; unitPrice: string; total: string }[] };
 const s = (v: number | string | null | undefined) => (v === null || v === undefined ? "" : String(v));
 const toDraft = (inv: Invoice): Draft => ({
@@ -141,6 +173,7 @@ function FieldsPanel({
   const c = inv.currency;
   const [reviewer, setReviewer] = useReviewer();
   const [reason, setReason] = useState("");
+  const [source, setSource] = useState("");
   const [busy, setBusy] = useState(false);
   const [draft, setDraft] = useState<Draft>(() => ({ ...toDraft(inv), ...(patch ?? {}) }));
   const key = run.audit.length + JSON.stringify(patch ?? {});
@@ -202,8 +235,9 @@ function FieldsPanel({
       const r = await submitCorrection(run.id, {
         reviewer,
         reason,
+        source,
         invoice: {
-          invoiceNumber: draft.invoiceNumber || null,
+          invoiceNumber: inv.invoiceNumber ? draft.invoiceNumber || null : null,
           issueDate: draft.issueDate || null,
           poReference: draft.poReference || null,
           subtotal: draft.subtotal === "" ? null : Number(draft.subtotal),
@@ -225,16 +259,19 @@ function FieldsPanel({
   };
 
   return (
-    <section className="sec" id="fields">
-      <div className="sec-head">
-        <h3>Extracted data</h3>
-        <Attribution kind="ai">{run.extractionMethod}</Attribution>
-        {isOpen(run.status) && !editing && (
+    <Section
+      id="fields"
+      title="Extracted data"
+      meta={<Attribution kind="ai">{run.extractionMethod}</Attribution>}
+      defaultOpen
+      action={
+        isOpen(run.status) && !editing ? (
           <button className="btn btn-sm" onClick={() => setEditing(true)}>
             <PencilLine size={14} /> Correct fields
           </button>
-        )}
-      </div>
+        ) : null
+      }
+    >
       {!editing ? (
         <>
           {onLocate && <p className="muted small" style={{ margin: "0 0 8px" }}>Click a value to see where it appears in the original.</p>}
@@ -329,10 +366,15 @@ function FieldsPanel({
       ) : (
         <div className="editor">
           <p className="small muted" style={{ marginTop: 0 }}>
-            Enter what the document actually says. Saving re-runs every rule; vendor and bank account can't be edited.
+            Correct a value only where the document or the vendor's written confirmation shows it, and cite the source. Saving re-runs every rule; vendor and bank account can't be edited.
           </p>
           <div className="egrid">
-            {inp("invoiceNumber", "Invoice no.")}
+            {inv.invoiceNumber ? inp("invoiceNumber", "Invoice no.") : (
+              <div className="ef ef-low">
+                <span>Invoice no.</span>
+                <span className="small muted">Missing on the document. Request a revised invoice from the vendor; don't enter one manually.</span>
+              </div>
+            )}
             {inp("issueDate", "Date (yyyy-mm-dd)")}
             {inp("poReference", "PO reference")}
           </div>
@@ -371,9 +413,10 @@ function FieldsPanel({
           <div className="form-row">
             <input className="input" aria-label="Reviewer name" value={reviewer} onChange={(e) => setReviewer(e.target.value)} placeholder="Your name" />
             <input className="input" aria-label="Reason for correction" value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Reason, e.g. labour amount reads 1850 on the photo" />
+            <input className="input" aria-label="Source of corrected value" value={source} onChange={(e) => setSource(e.target.value)} placeholder="Source, e.g. page 1, line 2 of the scan, or vendor email 5 Nov" />
           </div>
           <div className="actions">
-            <button className="btn btn-primary" disabled={busy || !reviewer.trim() || reason.trim().length < 5} onClick={save}>
+            <button className="btn btn-primary" disabled={busy || !reviewer.trim() || !!justificationError(reason) || source.trim().length < 5} onClick={save}>
               {busy ? "Re-running checks…" : "Save & re-run checks"}
             </button>
             <button className="btn" onClick={() => setEditing(false)} disabled={busy}>
@@ -382,52 +425,76 @@ function FieldsPanel({
           </div>
         </div>
       )}
-    </section>
+    </Section>
   );
 }
 
 // ---------------- PO suggestions ----------------
 
-function PoSuggestions({ run, allRuns, onUse }: { run: RunRecord; allRuns: RunRecord[]; onUse: (poId: string) => void }) {
+function PoSuggestions({ run, allRuns, onUse, defaultOpen }: { run: RunRecord; allRuns: RunRecord[]; onUse: (poId: string) => void; defaultOpen: boolean }) {
   const vendor = VENDORS.find((v) => v.id === run.vendorId) ?? null;
   const list = useMemo(() => suggestPos(run.invoice, vendor, PURCHASE_ORDERS, buildLedger(ERP_LEDGER, allRuns.filter((r) => r.id !== run.id)), { ...DEFAULT_RULES, ...(run.rules ?? {}) }), [run, vendor, allRuns]);
   if (!vendor || run.poMatch.method === "explicit" || !list.length) return null;
-  return (
-    <section className="sec">
-      <div className="sec-head">
-        <h3>Suggested purchase orders</h3>
-        <span className="muted small">Ranked by vendor, amount and lines. Nothing is applied without you.</span>
-      </div>
-      <div className="sugg">
-        {list.slice(0, 3).map((sg) => (
-          <div key={sg.poId} className="sugg-row">
-            <div className="sugg-fit">
-              <b>{sg.amountFitPct}%</b>
-              <small>fit</small>
-            </div>
-            <div>
-              <div className="sugg-id">
-                {sg.poId} {run.poMatch.po?.id === sg.poId && <span className="tag tag-warn">Engine's suggestion</span>}
-              </div>
-              <div className="muted small">{sg.reasons.join(" · ")}</div>
-              {!sg.withinValue && <div className="t-bad small">Invoice exceeds the open value</div>}
-            </div>
-            {isOpen(run.status) && (
-              <button className="btn btn-sm" onClick={() => onUse(sg.poId)}>
-                Use this PO
-              </button>
-            )}
+  // A suggestion is only "plausible" when the amount is in range AND at least one line matches.
+  // Anything else is shown as a weak match with the reason, never as an obvious pick.
+  const weak = (sg: (typeof list)[number]) => sg.amountFitPct < 50 || sg.linesMatched === 0 || !sg.withinValue;
+  const good = list.filter((x) => !weak(x)).slice(0, 3);
+  const poor = list.filter(weak).slice(0, 3);
+  const row = (sg: (typeof list)[number]) => {
+    const w = weak(sg);
+    const problems = [
+      sg.linesMatched === 0 ? `None of the ${sg.linesTotal} invoice lines appear on this PO.` : sg.linesMatched < sg.linesTotal ? `Only ${sg.linesMatched} of ${sg.linesTotal} lines match.` : null,
+      sg.amountFitPct < 50 ? `Amount is only a ${sg.amountFitPct}% fit for the open value (${money(sg.openValue, PURCHASE_ORDERS.find((p) => p.id === sg.poId)?.currency ?? run.invoice.currency)}).` : null,
+      !sg.withinValue ? "The invoice is more than the open value on this PO." : null,
+    ].filter(Boolean);
+    return (
+      <div key={sg.poId} className={`sugg-row ${w ? "sugg-weak" : ""}`}>
+        <div className="sugg-fit">
+          <b>{sg.amountFitPct}%</b>
+          <small>amount fit</small>
+        </div>
+        <div>
+          <div className="sugg-id">
+            {sg.poId} {w && <span className="tag tag-err">Weak match</span>} {run.poMatch.po?.id === sg.poId && <span className="tag tag-warn">Engine's suggestion</span>}
           </div>
-        ))}
+          <div className="muted small">{sg.reasons.join(" · ")}</div>
+          {problems.map((t) => (
+            <div key={String(t)} className="t-bad small">
+              {t}
+            </div>
+          ))}
+        </div>
+        {isOpen(run.status) && (
+          <button className={`btn btn-sm ${w ? "btn-quiet" : ""}`} onClick={() => onUse(sg.poId)} title="Opens the correction form with this PO. Every rule re-runs when you save.">
+            {w ? "Try anyway" : "Use & re-check"}
+          </button>
+        )}
       </div>
-    </section>
+    );
+  };
+  return (
+    <Section id="po-suggestions" title="Suggested purchase orders" meta={good.length ? `${good.length} plausible` : "no plausible match"} defaultOpen={defaultOpen}>
+      <p className="muted small sec-note">A suggestion is a lead, not proof. Choosing one opens the correction form, and every rule re-runs before anything changes.</p>
+      {good.length > 0 ? <div className="sugg">{good.map(row)}</div> : <p className="small sugg-none">No open PO for this vendor fits this invoice. Ask the requester which PO it belongs to, or raise one.</p>}
+      {poor.length > 0 && (
+        <details className="acc-item sugg-more">
+          <summary>
+            <span className="acc-title">Weak matches ({poor.length})</span>
+            <ChevronDown size={16} className="acc-chev" aria-hidden />
+          </summary>
+          <div className="acc-body">
+            <div className="sugg">{poor.map(row)}</div>
+          </div>
+        </details>
+      )}
+    </Section>
   );
 }
 
 // ---------------- Guided actions ----------------
 
 const ACTION_META: Record<ReviewActionId, { icon: typeof Check; help: string }> = {
-  verify_bank: { icon: Landmark, help: "Record that you called the vendor on the number in the vendor master and they confirmed the new account. This clears only the security hold; any other open finding stays open." },
+  verify_bank: { icon: Landmark, help: "Record your own attestation that you called the vendor on the number in the vendor master and they confirmed the new account. The system does not verify the call. This clears only the security hold; any other open finding stays open." },
   confirm_po: { icon: ClipboardCheck, help: "Record that the PO owner confirmed this invoice belongs to the suggested PO. Other findings stay open." },
   confirm_fields: { icon: BadgeCheck, help: "Record that you checked every extracted figure against the original document. This does not approve the invoice; correct any wrong value with “Correct extracted fields” first." },
   resolve_po: { icon: ClipboardCheck, help: "Record an authorised PO amendment or approval for the discrepancy below. The PO record itself isn't changed here. If the vendor sends a corrected invoice instead, use “Correct extracted fields” and every rule re-runs." },
@@ -452,17 +519,17 @@ function GuidedActions({
 }) {
   const options = availableActions(run);
   const [active, setActive] = useState<ReviewActionId | null>(null);
-  const formRef = useRef<HTMLElement>(null);
   useEffect(() => {
     if (!request) return;
     setActive(request.id);
-    setTimeout(() => formRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 30);
+    setTimeout(() => goTo("resolve"), 30);
   }, [request]);
   const [reviewer, setReviewer] = useReviewer();
   const [note, setNote] = useState("");
   const [verified, setVerified] = useState(false);
   const [authorizedBy, setAuthorizedBy] = useState("");
   const [reference, setReference] = useState("");
+  const [callRef, setCallRef] = useState("");
   const [busy, setBusy] = useState(false);
   const [touched, setTouched] = useState(false);
   const vendor = VENDORS.find((v) => v.id === run.vendorId);
@@ -471,7 +538,7 @@ function GuidedActions({
   const recommended: ReviewActionId | "correct" | null = (() => {
     const k = requiredAction(run, open);
     if (k === "bank") return "verify_bank";
-    if (k === "onboard") return "request_info";
+    if (k === "onboard" || k === "clarify") return "request_info";
     if (needsCorrection) return "correct";
     if (k === "fields") return "confirm_fields";
     if (k === "po") return "confirm_po";
@@ -494,21 +561,23 @@ function GuidedActions({
   const errors = touched
     ? [
         !reviewer.trim() && "Enter your name.",
-        note.trim().length < 5 && "Add a short justification (5+ characters).",
-        opt?.needsVerification && !verified && "Confirm the independent call-back.",
+        justificationError(note),
+        opt?.needsVerification && callRef.trim().length < 3 && "Enter the verification reference (who you spoke to, when, or a ticket number).",
+        opt?.needsVerification && !verified && "Tick the manual attestation.",
         opt?.needsAuthorization && !authorizedBy.trim() && "Enter who authorised the PO change.",
         opt?.needsAuthorization && !reference.trim() && "Enter the amendment or approval reference.",
       ].filter(Boolean)
     : [];
   const submit = async (o: ActionOption) => {
     setTouched(true);
-    if (!reviewer.trim() || note.trim().length < 5 || (o.needsVerification && !verified) || (o.needsAuthorization && (!authorizedBy.trim() || !reference.trim()))) return;
+    if (!reviewer.trim() || justificationError(note) || (o.needsVerification && (!verified || callRef.trim().length < 3)) || (o.needsAuthorization && (!authorizedBy.trim() || !reference.trim()))) return;
     setBusy(true);
     try {
-      const r = await submitReview(run.id, { action: o.id, reviewer, justification: note, verificationConfirmed: verified, authorizedBy, reference });
+      const r = await submitReview(run.id, { action: o.id, reviewer, justification: note, verificationConfirmed: verified, verificationReference: callRef, authorizedBy, reference });
       setActive(null);
       setNote("");
       setVerified(false);
+      setCallRef("");
       setAuthorizedBy("");
       setReference("");
       setTouched(false);
@@ -520,46 +589,41 @@ function GuidedActions({
       setBusy(false);
     }
   };
-  const primary = options.filter((o) => o.tone === "primary");
-  const secondary = options.filter((o) => o.tone !== "primary");
-  const card = (o: ActionOption) => {
-    const I = ACTION_META[o.id].icon;
+  // One primary action (the recommended one), then quieter secondary actions.
+  // Nothing is hidden: locked actions stay visible with their reason, and Reject is always last.
+  type Card = { id: string; label: string; icon: typeof Check; allowed: boolean; tone: ActionOption["tone"]; onClick: () => void; on: boolean };
+  const cards: Card[] = [
+    ...options.filter((o) => o.tone === "primary").map((o) => ({ id: o.id, label: o.label, icon: ACTION_META[o.id].icon, allowed: o.allowed, tone: o.tone, on: active === o.id, onClick: () => (setActive(active === o.id ? null : o.id), setTouched(false)) })),
+    ...(isOpen(run.status) ? [{ id: "correct", label: "Correct extracted fields", icon: PencilLine, allowed: true, tone: "neutral" as const, on: false, onClick: onCorrect }] : []),
+    ...options.filter((o) => o.tone !== "primary").map((o) => ({ id: o.id, label: o.label, icon: ACTION_META[o.id].icon, allowed: o.allowed, tone: o.tone, on: active === o.id, onClick: () => (setActive(active === o.id ? null : o.id), setTouched(false)) })),
+  ];
+  const main = cards.find((c) => c.id === recommended && c.allowed) ?? cards.find((c) => c.allowed && c.tone !== "danger");
+  const rest = cards.filter((c) => c !== main).sort((a, b) => Number(a.tone === "danger") - Number(b.tone === "danger"));
+  const btn = (c: Card, primary: boolean) => {
+    const I = c.icon;
     return (
-      <button key={o.id} className={`act ${active === o.id ? "on" : ""} ${o.tone === "danger" ? "act-danger" : ""} ${recommended === o.id ? "act-rec" : ""}`} disabled={!o.allowed} aria-pressed={active === o.id} onClick={() => (setActive(active === o.id ? null : o.id), setTouched(false))} title={o.blockedReason}>
-        <I size={18} aria-hidden />
-        <span className="act-label">{o.label}</span>
-        {!o.allowed ? <span className="act-lock">Locked</span> : recommended === o.id ? <span className="act-tag">Recommended</span> : null}
+      <button key={c.id} className={`act ${primary ? "act-rec" : ""} ${c.on ? "on" : ""} ${c.tone === "danger" ? "act-danger" : ""}`} disabled={!c.allowed} aria-pressed={c.id === "correct" ? undefined : c.on} onClick={c.onClick} title={options.find((o) => o.id === c.id)?.blockedReason}>
+        <I size={primary ? 18 : 15} aria-hidden />
+        <span className="act-label">{c.label}</span>
+        {!c.allowed ? <span className="act-lock">Locked</span> : null}
       </button>
     );
   };
+  const locked = options.filter((o) => !o.allowed && o.blockedReason && o.id !== "request_info");
   return (
-    <section className="sec" id="resolve" ref={formRef}>
-      <div className="sec-head">
-        <h3>Resolve</h3>
-        <span className="muted small">Every action is logged with your name and reason.</span>
-      </div>
-      <div className="next">
-        <span className="next-k">Recommended next step</span>
-        <span>{nextStep(run, open)}</span>
-      </div>
-      <div className="acts">
-        {primary.map(card)}
-        {isOpen(run.status) && (
-          <button className={`act ${recommended === "correct" ? "act-rec" : ""}`} onClick={onCorrect}>
-            <PencilLine size={18} aria-hidden />
-            <span className="act-label">Correct extracted fields</span>
-            {recommended === "correct" && <span className="act-tag">Recommended</span>}
-          </button>
-        )}
-      </div>
-      <div className="acts acts-2">{secondary.map(card)}</div>
-      {options
-        .filter((o) => !o.allowed && o.blockedReason)
-        .map((o) => (
-          <p key={o.id} className="locked-note">
-            <b>{o.label}</b> is locked: {o.blockedReason}
-          </p>
-        ))}
+    <Section id="resolve" title="Resolve" meta="Every action is logged with your name and reason" defaultOpen>
+      {main && (
+        <div className="act-main">
+          <span className="act-kicker">Recommended</span>
+          {btn(main, true)}
+        </div>
+      )}
+      <div className="acts acts-2">{rest.map((c) => btn(c, false))}</div>
+      {locked.map((o) => (
+        <p key={o.id} className="locked-note">
+          <b>{o.label}</b> is locked: {o.blockedReason}
+        </p>
+      ))}
       {opt && opt.allowed && (
         <div className="act-form" role="region" aria-label={opt.label}>
           <p className="act-help">{ACTION_META[opt.id].help}</p>
@@ -587,16 +651,19 @@ function GuidedActions({
             </div>
           )}
           {opt.needsVerification && (
+            <input className="input" aria-label="Verification reference" placeholder="Verification reference: contact spoken to, date/time, or ticket no." value={callRef} onChange={(e) => setCallRef(e.target.value)} />
+          )}
+          {opt.needsVerification && (
             <label className="verify">
               <input type="checkbox" checked={verified} onChange={(e) => setVerified(e.target.checked)} />
               <span>
-                I called {vendor ? `${vendor.name} on ${vendor.phone}` : "the vendor"} (the number on file, not one from the invoice) and they confirmed the new account.
+                I called {vendor ? `${vendor.name} on ${vendor.phone}` : "the vendor"} (the number on file, not one from the invoice) and they confirmed the new account. This is my manual attestation; the system has not independently verified it.
               </span>
             </label>
           )}
           <div className="form-row">
             <input className="input" aria-label="Reviewer name" placeholder="Your name (demo identity)" value={reviewer} onChange={(e) => setReviewer(e.target.value)} />
-            <input className="input" aria-label="Justification" placeholder="Justification for the audit trail" value={note} onChange={(e) => setNote(e.target.value)} />
+            <input className="input" aria-label="Justification" placeholder="Specific justification: what you checked, with whom" value={note} onChange={(e) => setNote(e.target.value)} />
           </div>
           {errors.length > 0 && (
             <ul className="form-errors" role="alert">
@@ -615,7 +682,7 @@ function GuidedActions({
           </div>
         </div>
       )}
-    </section>
+    </Section>
   );
 }
 
@@ -623,32 +690,32 @@ function GuidedActions({
 // Derived from the findings and their resolution state (lib/controls.ts);
 // resolving a control in Resolve updates it immediately.
 
-function ControlsChecklist({ run, onAction }: { run: RunRecord; onAction: (a: ControlAction) => void }) {
+function ControlsChecklist({ run, onAction, detailed }: { run: RunRecord; onAction: (a: ControlAction) => void; detailed: boolean }) {
   const items = deriveControls(run);
   const unresolved = items.filter((i) => i.status === "unresolved");
   const closed = run.status === "approved" || run.status === "rejected";
-  const jump = (id: string) => document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "center" });
+  const jump = (id: string) => goTo(id, "center");
   const icon = { passed: <Check size={14} strokeWidth={3} />, resolved: <Check size={14} strokeWidth={3} />, unresolved: <TriangleAlert size={13} strokeWidth={2.6} />, na: <CircleDashed size={14} /> };
   const statusText = { passed: "Passed", resolved: "Resolved", unresolved: "Unresolved", na: "Not applicable" };
   return (
-    <section className="sec" id="controls">
-      <div className="sec-head">
-        <h3>{closed ? "Controls" : "Before this invoice can be approved"}</h3>
-      </div>
+    <Section id="controls" title={closed ? "Controls" : "Before approval"} meta={unresolved.length ? `${unresolved.length} unresolved` : "all clear"} defaultOpen>
       <ul className="ctl">
         {items.map((c) => {
-          const text = c.status === "unresolved" ? (SHORT[c.open[0]] ?? REASON_LABEL[c.open[0]]) : c.status === "resolved" ? c.resolvedBy : PASS_TEXT[c.key];
+          const caution = c.status === "passed" ? c.caution : undefined;
+          const full = caution ? caution.text : c.status === "unresolved" ? (SHORT[c.open[0]] ?? REASON_LABEL[c.open[0]]) : c.status === "resolved" ? c.resolvedBy : PASS_TEXT[c.key];
+          // Summary: only failing controls explain themselves; cleared controls are one line.
+          const text = detailed || caution || c.status === "unresolved" ? full : c.status === "resolved" ? c.resolvedBy : null;
           return (
-            <li key={c.key} className={`ctl-${c.status}`}>
+            <li key={c.key} className={`ctl-${caution ? "caution" : c.status}`}>
               <span className="ctl-i" aria-hidden>
-                {icon[c.status]}
+                {caution ? <CircleDashed size={14} /> : icon[c.status]}
               </span>
               <div className="ctl-body">
                 <div className="ctl-top">
                   <b>{c.label}</b>
-                  <span className="ctl-st">{statusText[c.status]}</span>
+                  <span className="ctl-st">{caution ? caution.label : statusText[c.status]}</span>
                 </div>
-                <div className="ctl-text">{text}</div>
+                {text && <div className="ctl-text">{text}</div>}
                 {c.status === "unresolved" && c.open.length > 1 && <div className="ctl-more">Also: {c.open.slice(1).map((x) => REASON_LABEL[x]).join(", ")}</div>}
               </div>
               <div className="ctl-acts">
@@ -667,6 +734,7 @@ function ControlsChecklist({ run, onAction }: { run: RunRecord; onAction: (a: Co
           );
         })}
       </ul>
+      {!closed && (
       <div className={`ctl-foot ${unresolved.length ? "ctl-foot-locked" : ""}`}>
         {closed ? (
           run.status === "approved" ? (
@@ -688,7 +756,8 @@ function ControlsChecklist({ run, onAction }: { run: RunRecord; onAction: (a: Co
           </>
         )}
       </div>
-    </section>
+      )}
+    </Section>
   );
 }
 
@@ -749,11 +818,12 @@ export function Investigation({
   };
   const startCorrect = () => {
     setEditing(true);
-    setTimeout(() => document.getElementById("fields")?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
+    setTimeout(() => goTo("fields"), 50);
   };
 
-  const decisionTitle = run.status === "approved" && !lastReview ? "All checks passed" : lastReview && !isOpen(run.status) ? `${lastReview.action}` : primary ? REASON_LABEL[primary.code] : run.decision.headline;
-  const decisionLine = lastReview && !isOpen(run.status) ? `“${lastReview.note}” · ${lastReview.actor}` : primary ? SHORT[primary.code] ?? primary.title : "Totals reconcile, vendor and bank verified, within PO tolerance, no duplicate.";
+  const summary = caseSummary(run);
+  const decisionTitle = kind === "original" ? summary.title : primary ? REASON_LABEL[primary.code] : run.decision.headline;
+  const decisionLine = kind === "original" ? summary.line : primary ? SHORT[primary.code] ?? primary.title : run.decision.headline;
 
   const right = (
     <div className="inv-right">
@@ -767,14 +837,21 @@ export function Investigation({
               Detailed
             </button>
           </div>
-          <span className="attrs">
-            <Attribution kind="ai" />
-            <Attribution kind="rules">{lastReview ? `Decided by ${lastReview.actor}` : "Decided by rules"}</Attribution>
-          </span>
+          {detailed && (
+            <span className="attrs">
+              <Attribution kind="ai" />
+              <Attribution kind="rules">{lastReview ? `Decided by ${lastReview.actor}` : "Decided by rules"}</Attribution>
+            </span>
+          )}
         </div>
         <div className="decision-status">{kind === "original" ? statusLabel(run.status) : "Duplicate submission blocked"}</div>
         <h2 className="decision-title">{decisionTitle}</h2>
         <p className="decision-line">{decisionLine}</p>
+        {kind === "original" && (
+          <p className="decision-next">
+            <b>Next:</b> {summary.next}
+          </p>
+        )}
         {kind !== "original" && run.duplicateOf && (
           <div className="dup-note">
             <div>
@@ -799,13 +876,15 @@ export function Investigation({
         )}
         {kind === "original" && (
           <div className="ready">
-            <span className={`ready-pill rp-${checks === "Passed" ? "ok" : checks === "Incomplete" ? "warn" : "bad"}`}>
-              <small>Invoice checks</small> {checks}
-            </span>
+            {detailed && (
+              <span className={`ready-pill rp-${checks === "Passed" ? "ok" : checks === "Incomplete" ? "warn" : "bad"}`}>
+                <small>Invoice checks</small> {checks}
+              </span>
+            )}
             <span className={`ready-pill rp-${ready.label === "Ready" ? "ok" : ready.label === "Closed" ? "muted" : ready.label === "Awaiting approval" ? "info" : ready.label === "Awaiting verification" ? "warn" : "bad"}`} title={ready.detail}>
               <small>Payment readiness</small> {ready.label}
             </span>
-            <span className="muted small">{ready.detail}</span>
+            {detailed && <span className="muted small">{ready.detail}</span>}
           </div>
         )}
         {detailed && (
@@ -813,9 +892,11 @@ export function Investigation({
             <div>
               <span className="muted small">Rule outcome</span> {run.decision.headline}
             </div>
-            <div>
-              <span className="muted small">Deciding codes</span> {run.decision.decidingCodes.map((c) => <code key={c} className="code">{c}</code>)}
-            </div>
+            {run.decision.decidingCodes.length > 0 && (
+              <div>
+                <span className="muted small">Deciding codes</span> {run.decision.decidingCodes.map((c) => <code key={c} className="code">{c}</code>)}
+              </div>
+            )}
             <div>
               <span className="muted small">Full instruction</span> {run.decision.nextAction}
             </div>
@@ -823,18 +904,17 @@ export function Investigation({
         )}
       </section>
 
-      {kind === "original" && <ControlsChecklist run={run} onAction={onControl} />}
+      {kind === "original" && <ControlsChecklist run={run} onAction={onControl} detailed={detailed} />}
 
-      <section className="sec">
-        <div className="sec-head">
-          <h3>Evidence</h3>
-          {!detailed && <span className="muted small">For the open controls · Detailed view shows every check</span>}
-        </div>
+      {kind === "original" || isOpen(run.status) ? <GuidedActions run={run} onUpdated={saved} onError={(m) => notify(m, "err")} onCorrect={startCorrect} request={request} /> : null}
+
+      <Section id="evidence" title="Evidence" meta={detailed ? "every check" : "the issue first, the rest collapsed"} defaultOpen>
         <EvidenceStack run={run} relevantOnly={!detailed} />
-      </section>
+      </Section>
 
       {(detailed || poMatters) && (
         <PoSuggestions
+          defaultOpen={poMatters}
           run={run}
           allRuns={allRuns}
           onUse={(poId) => {
@@ -857,16 +937,10 @@ export function Investigation({
         />
       )}
 
-      {kind === "original" || isOpen(run.status) ? <GuidedActions run={run} onUpdated={saved} onError={(m) => notify(m, "err")} onCorrect={startCorrect} request={request} /> : null}
-
       {others.length > 0 && (
-        <section className="sec">
-          <div className="sec-head">
-            <h3>{detailed ? "All rule findings" : "Other findings"}</h3>
-            <span className="muted small">{others.length}</span>
-          </div>
+        <Section id="findings" title={detailed ? "All rule findings" : "Other findings"} meta={others.length} defaultOpen={detailed}>
           <Findings findings={others} run={run} resolved={resolved} showCodes={detailed} />
-        </section>
+        </Section>
       )}
 
       <section className="sec">
@@ -890,7 +964,7 @@ export function Investigation({
             </details>
           </>
         )}
-        <details className="acc-item" open={detailed || run.audit.some((e) => e.kind === "reviewer")}>
+        <details className="acc-item" open={detailed}>
           <summary>
             <History size={16} aria-hidden />
             <span className="acc-title">Audit history · {3 + run.audit.filter((e) => e.kind === "reviewer").length} events</span>

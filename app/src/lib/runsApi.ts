@@ -43,5 +43,5 @@ export async function submitCorrection(id: string, req: CorrectionRequest): Prom
 
 export async function resetRuns(): Promise<void> {
   const res = await fetch("/api/runs", { method: "DELETE" });
-  if (!res.ok) throw new Error(`Could not reset (${res.status})`);
+  if (!res.ok) throw new Error(((await res.json().catch(() => ({}))) as { error?: string }).error ?? `Could not reset (${res.status})`);
 }

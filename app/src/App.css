@@ -3180,3 +3180,289 @@ kbd {
   padding-bottom: 14px;
   border-radius: var(--r) var(--r) 0 0;
 }
+
+/* Pre-submission pass: one primary action, compact rows, quiet secondaries */
+.decision-next {
+  margin: 8px 0 0;
+  font-size: 14px;
+  color: var(--ink);
+}
+.decision-next b {
+  color: var(--brand);
+}
+.ctl li {
+  padding: 7px 12px;
+  gap: 10px;
+}
+.act:not(.act-rec):not(.on) {
+  font-weight: 500;
+  box-shadow: none;
+}
+.act-rec:not(:disabled) {
+  background: var(--brand);
+  border-color: var(--brand);
+  color: #fff;
+}
+.act-rec:not(:disabled) svg {
+  color: #fff;
+}
+.act-rec:hover:not(:disabled) {
+  background: var(--brand);
+  filter: brightness(1.08);
+}
+.act-rec .act-tag {
+  background: rgba(255, 255, 255, 0.2);
+  color: #fff;
+}
+.act-rec.on {
+  box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.25);
+}
+.acts-2 .act {
+  padding: 7px 11px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--muted);
+}
+.acts-2 .act-danger {
+  color: var(--bad);
+}
+.acts-2 .act svg {
+  width: 16px;
+  height: 16px;
+}
+.act-form .input {
+  min-width: 0;
+}
+.act-form .verify {
+  align-items: flex-start;
+}
+
+@media (max-width: 560px) {
+  .cmp-row {
+    grid-template-columns: 78px minmax(0, 1fr) minmax(0, 1fr) 24px;
+    gap: 8px;
+    font-size: 13px;
+    overflow-wrap: anywhere;
+  }
+  .ctl li {
+    grid-template-columns: 26px minmax(0, 1fr);
+  }
+  .ctl-acts {
+    grid-column: 2;
+    flex-wrap: wrap;
+    white-space: normal;
+  }
+}
+
+.ev-head {
+  flex-wrap: wrap;
+  gap: 6px 10px;
+}
+.ev {
+  min-width: 0;
+}
+
+.inv-right,
+.inv-right > * {
+  min-width: 0;
+}
+.ev {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.ev-stack {
+  grid-template-columns: minmax(0, 1fr);
+}
+.ev-stack > * {
+  min-width: 0;
+}
+
+.acts {
+  grid-template-columns: repeat(auto-fill, minmax(236px, 1fr));
+}
+.acts-2 {
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+}
+.act-tag {
+  flex: none;
+  white-space: nowrap;
+}
+
+/* ---- Final pass: expandable sections, compact controls, one primary action ---- */
+.sec {
+  padding: 14px 24px;
+}
+.sec-x > details > summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 32px;
+  cursor: pointer;
+  list-style: none;
+}
+.sec-x > details > summary::-webkit-details-marker {
+  display: none;
+}
+.sec-x > details > summary:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+.sec-x h3 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 650;
+}
+.sec-meta {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+.sec-act {
+  margin-left: auto;
+}
+.sec-act + .acc-chev {
+  margin-left: 0;
+}
+.sec-x > details > summary .acc-chev {
+  margin-left: auto;
+  flex: none;
+}
+.sec-x > details[open] > summary .acc-chev {
+  transform: rotate(180deg);
+}
+.sec-body {
+  padding-top: 12px;
+}
+.sec-note {
+  margin: 0 0 10px;
+}
+
+/* controls: one consistent row height; only failing rows explain themselves */
+.ctl li {
+  min-height: 40px;
+  padding: 6px 12px;
+}
+.ctl-passed,
+.ctl-na {
+  background: var(--surface-2) !important;
+}
+.ctl-unresolved {
+  box-shadow: inset 4px 0 0 var(--warn);
+}
+.ctl-unresolved .ctl-text {
+  color: var(--ink);
+  font-weight: 500;
+}
+.ctl-text {
+  font-size: 13px;
+}
+.ctl-foot {
+  margin-top: 8px;
+}
+
+/* resolve: one primary action, everything else quiet but reachable */
+.act-main {
+  display: grid;
+  gap: 6px;
+}
+.act-kicker {
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--brand);
+}
+.act-main .act {
+  width: 100%;
+  min-height: 46px;
+  font-size: 14.5px;
+  font-weight: 650;
+}
+.acts-2 {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+.acts-2 .act {
+  flex: 0 1 auto;
+  height: 34px;
+  padding: 0 12px;
+  background: var(--surface);
+}
+.act-danger {
+  margin-left: auto;
+}
+
+/* evidence: lead block open, supporting blocks collapsed */
+.ev-stack {
+  gap: 8px;
+}
+.ev-more > summary .muted {
+  white-space: nowrap;
+}
+.ev-more > .acc-body {
+  padding: 0 0 4px;
+}
+.ev-more > .acc-body > .ev {
+  border: none;
+  border-top: 1px solid var(--line);
+  border-radius: 0;
+}
+
+/* PO suggestions: weak matches never look like a recommendation */
+.sugg-weak {
+  background: var(--surface-2);
+}
+.sugg-weak .sugg-fit b {
+  color: var(--bad-ink);
+}
+.btn-quiet {
+  background: transparent;
+  color: var(--muted);
+}
+.sugg-none {
+  margin: 0;
+  color: var(--ink);
+}
+.sugg-more {
+  margin-top: 10px;
+}
+
+@media (max-width: 560px) {
+  .sec {
+    padding: 12px 16px;
+  }
+  .act-danger {
+    margin-left: 0;
+  }
+  .acts-2 .act {
+    flex: 1 1 calc(50% - 8px);
+  }
+}
+.acts-2 .act {
+  height: auto;
+  min-height: 34px;
+}
+@media (max-width: 560px) {
+  .acts-2 .act {
+    flex: 1 1 100%;
+    min-height: 40px;
+  }
+}
+
+.ev-more > .acc-body > .ev > .ev-head {
+  display: none;
+}
+
+.ctl-caution .ctl-i {
+  background: var(--warn-bg);
+  color: var(--warn-ink);
+  border: 1px solid var(--warn);
+}
+.ctl-caution .ctl-st {
+  color: var(--warn-ink);
+}

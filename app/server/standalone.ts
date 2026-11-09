@@ -5,9 +5,12 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { readFile, stat } from "node:fs/promises";
 import { extname, join } from "node:path";
 import { handleApi } from "./api.ts";
+import { accessConfigError, accessEnabled, challenge, isAuthorised } from "./access.ts";
 import { getHealth } from "./proxy.ts";
 
-const PORT = Number(process.env.PORT ?? 3000);
+// The platform supplies PORT (and optionally HOST). Without HOST, Node listens on all interfaces.
+const PORT = Number.parseInt(process.env.PORT ?? "", 10) || 3000;
+const HOST = process.env.HOST?.trim() || undefined;
 const DIST = join(import.meta.dirname, "..", "dist");
 
 const MIME_TYPES: Record<string, string> = {
@@ -50,6 +53,12 @@ async function serveStatic(req: IncomingMessage, res: ServerResponse): Promise<b
 
 const server = createServer(async (req, res) => {
   try {
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("X-Frame-Options", "DENY");
+    res.setHeader("Referrer-Policy", "no-referrer");
+    // The app shell is gated too; only the minimal health probe is public.
+    const path = (req.url ?? "").split("?")[0];
+    if (path !== "/api/health" && !isAuthorised(req)) return challenge(res);
     if (await handleApi(req, res)) return;
     if (await serveStatic(req, res)) return;
     // SPA fallback
@@ -65,8 +74,17 @@ const server = createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
+const configError = accessConfigError();
+if (configError) {
+  console.error(`Refusing to start: ${configError}`);
+  process.exit(1);
+}
+
+const onListening = () => {
   const h = getHealth();
-  console.log(`AP invoice decision server on :${PORT}`);
+  console.log(`AP invoice decision server on ${HOST ?? "0.0.0.0/::"}:${PORT}`);
+  console.log(`  Access: ${accessEnabled() ? "protected by DEMO_ACCESS_KEY" : "OPEN (no DEMO_ACCESS_KEY set)"}`);
   console.log(`  LLM: ${h.ok ? `${h.provider} / ${h.model}` : h.reason}`);
-});
+};
+if (HOST) server.listen(PORT, HOST, onListening);
+else server.listen(PORT, onListening);

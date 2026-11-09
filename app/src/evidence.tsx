@@ -2,7 +2,9 @@
 // seconds. Each pattern reads only stored run data; nothing is inferred here.
 
 import { VENDORS } from "./data/vendors";
-import { expectedTotal, fmtPct, maskAccount, money } from "./lib/engine";
+import { digitsOnly, expectedTotal, fmtPct, maskAccount, money } from "./lib/engine";
+import { ChevronDown } from "lucide-react";
+import { caseSummary } from "./lib/status";
 import type { RunRecord } from "./types";
 
 const has = (run: RunRecord, code: string) => run.findings.some((f) => f.code === code);
@@ -22,11 +24,14 @@ export function VendorBankEvidence({ run }: { run: RunRecord }) {
   const v = VENDORS.find((x) => x.id === run.vendorId);
   const bankBad = has(run, "BANK_ACCOUNT_MISMATCH");
   const bankResolved = (run.resolvedCodes ?? []).includes("BANK_ACCOUNT_MISMATCH");
+  const sum = caseSummary(run);
+  const bankDigits = digitsOnly(run.invoice.bankAccount).length;
+  const bankUnchecked = bankDigits < 4; // nothing (or too little) printed to compare
   return (
     <div className={`ev ${!v || bankBad ? "ev-alert" : ""}`} id="ev-vendor">
       <div className="ev-head">
         <span className="ev-title">Vendor & bank account</span>
-        {!v ? <span className="ev-flag ev-flag-hold">Not in vendor master</span> : bankBad ? <span className={`ev-flag ${bankResolved ? "ev-flag-ok" : "ev-flag-hold"}`}>{bankResolved ? "Change verified" : "Account mismatch"}</span> : <span className="ev-flag ev-flag-ok">Verified</span>}
+        {!v ? <span className="ev-flag ev-flag-hold">Not in vendor master</span> : bankBad ? <span className={`ev-flag ${bankResolved ? "ev-flag-ok" : "ev-flag-hold"}`}>{bankResolved ? "Verification recorded" : "Account mismatch"}</span> : bankUnchecked ? <span className="ev-flag ev-flag-warn">{bankDigits === 0 ? "Payee matched · no bank details" : "Bank not verified"}</span> : <span className="ev-flag ev-flag-ok">Verified</span>}
       </div>
       <div className="cmp">
         <div className="cmp-row cmp-h">
@@ -45,12 +50,22 @@ export function VendorBankEvidence({ run }: { run: RunRecord }) {
           <span className="cmp-k">Remit-to account</span>
           <span className="num-l">{run.invoice.bankAccount ? maskAccount(run.invoice.bankAccount) : <span className="muted">not printed</span>}</span>
           <span className="num-l">{v ? `${maskAccount(v.bankAccount)} · ${v.bankName}` : "—"}</span>
-          <Mark ok={!v ? null : !bankBad} />
+          <Mark ok={!v ? null : bankUnchecked ? null : !bankBad} />
         </div>
       </div>
-      {v && bankBad && (
+      {v && bankBad && bankResolved && (
+        <div className="ev-action">
+          <strong>Verification recorded (reviewer-attested):</strong> {sum.bankAttested ? `${sum.bankAttested.by}, ${sum.bankAttested.ref}. ` : ""}The software did not independently verify the call. The original mismatch stays on record and the vendor master is unchanged.
+        </div>
+      )}
+      {v && bankBad && !bankResolved && (
         <div className="ev-action">
           <strong>Security control:</strong> verify by calling {v.phone} (trusted contact on file). Never use a phone number or email from the invoice.
+        </div>
+      )}
+      {v && !bankBad && bankUnchecked && (
+        <div className="ev-action">
+          {bankDigits === 0 ? "No bank details are printed on this invoice." : "Too few digits are printed to compare."} Payment would go to the account on file. This invoice does not confirm it, so the account is not verified.
         </div>
       )}
       {!v && <div className="ev-action">Procurement must onboard and verify this payee (legal entity, tax ID, bank confirmation) before any approval.</div>}
@@ -61,6 +76,7 @@ export function VendorBankEvidence({ run }: { run: RunRecord }) {
 // ---------- Invoice vs PO ----------
 export function PoEvidence({ run }: { run: RunRecord }) {
   const { po, billing: b, method, lines } = run.poMatch;
+  const poAuth = caseSummary(run).poAuthorised;
   const c = run.invoice.currency;
   if (!po || !b) {
     return (
@@ -95,6 +111,11 @@ export function PoEvidence({ run }: { run: RunRecord }) {
         </span>
         <span className={`ev-flag ${flag[1]}`}>{flag[0]}</span>
       </div>
+      {poAuth && (
+        <div className="ev-action">
+          <strong>Authorised PO exception:</strong> {poAuth.by}, {poAuth.ref}. The discrepancy below is the original finding. The PO record itself is unchanged.
+        </div>
+      )}
       <div className="figs">
         <Fig k="Authorised PO value" v={money(b.poTotal, c)} />
         <Fig k="Billed before" v={money(b.previouslyBilled, c)} sub={b.priorInvoices.length ? `${b.priorInvoices.length} invoice${b.priorInvoices.length > 1 ? "s" : ""} · confirmed` : "none"} />
@@ -345,20 +366,41 @@ export function ArithmeticEvidence({ run }: { run: RunRecord }) {
 // Which patterns to show, most relevant first.
 // Summary view shows the evidence behind every finding that is still relevant
 // (most severe first); Detailed view shows all of it.
+// Evidence for the blocking issue comes first and stays open. Everything else
+// is supporting evidence: still complete, but collapsed (Summary) or expanded
+// in order (Detailed). Resolved issues keep their evidence; they just stop
+// competing for attention.
 export function EvidenceStack({ run, relevantOnly }: { run: RunRecord; relevantOnly?: boolean }) {
-  const blocks: { key: string; node: React.ReactNode; weight: number }[] = [];
-  const open = (code: string) => run.findings.some((f) => f.code === code && f.action !== "info");
-  if (run.duplicateOf || run.repeatSubmission) blocks.push({ key: "dup", node: <DuplicateEvidence run={run} />, weight: 4 });
-  blocks.push({ key: "vendor", node: <VendorBankEvidence run={run} />, weight: open("BANK_ACCOUNT_MISMATCH") || open("UNKNOWN_VENDOR") ? 3 : 0 });
-  blocks.push({ key: "po", node: <PoEvidence run={run} />, weight: ["CUMULATIVE_PO_EXCEEDED", "PO_AMOUNT_EXCEEDED", "PO_MATCH_UNCONFIRMED", "QUANTITY_EXCEEDS_PO", "PENDING_PO_CONFLICT", "PRICE_VARIANCE"].some(open) ? 2 : 1 });
-  blocks.push({ key: "math", node: <ArithmeticEvidence run={run} />, weight: open("ARITHMETIC_MISMATCH") ? 2.5 : -1 });
-  const sorted = blocks.filter((b) => b.weight >= 0).sort((a, b) => b.weight - a.weight);
-  const relevant = sorted.filter((b) => b.weight >= 2);
-  const shown = !relevantOnly ? sorted : relevant.length ? relevant : sorted.slice(0, 1);
+  const resolved = new Set(run.resolvedCodes ?? []);
+  const isOpenCode = (code: string) => run.findings.some((f) => f.code === code && f.action !== "info" && !resolved.has(code as never));
+  const wasFlagged = (code: string) => run.findings.some((f) => f.code === code && f.action !== "info");
+  const blocks: { key: string; title: string; note: string; node: React.ReactNode; weight: number }[] = [];
+  if (run.duplicateOf || run.repeatSubmission) blocks.push({ key: "dup", title: "Duplicate check", note: "duplicate found", node: <DuplicateEvidence run={run} />, weight: 4 });
+  const bankOpen = isOpenCode("BANK_ACCOUNT_MISMATCH") || isOpenCode("UNKNOWN_VENDOR");
+  blocks.push({ key: "vendor", title: "Vendor & bank account", note: bankOpen ? "needs attention" : wasFlagged("BANK_ACCOUNT_MISMATCH") ? "mismatch · verification recorded" : "verified", node: <VendorBankEvidence run={run} />, weight: bankOpen ? 3 : 0 });
+  const poCodes = ["CUMULATIVE_PO_EXCEEDED", "PO_AMOUNT_EXCEEDED", "PO_MATCH_UNCONFIRMED", "QUANTITY_EXCEEDS_PO", "PENDING_PO_CONFLICT", "PRICE_VARIANCE"];
+  const poOpen = poCodes.some(isOpenCode);
+  blocks.push({ key: "po", title: run.poMatch.po ? `Purchase order · ${run.poMatch.po.id}` : "Purchase order", note: poOpen ? "needs attention" : poCodes.some(wasFlagged) ? "discrepancy resolved" : "within PO", node: <PoEvidence run={run} />, weight: poOpen ? 2 : 1 });
+  const mathOpen = isOpenCode("ARITHMETIC_MISMATCH");
+  blocks.push({ key: "math", title: "Invoice arithmetic", note: mathOpen ? "doesn't add up" : "reconciles", node: <ArithmeticEvidence run={run} />, weight: mathOpen ? 2.5 : -1 });
+  const sorted = blocks.filter((b) => b.weight >= 0 || !relevantOnly).sort((a, b) => b.weight - a.weight);
+  const primary = sorted.filter((b) => b.weight >= 2);
+  const lead = primary.length ? primary : sorted.slice(0, 1);
+  const rest = sorted.filter((b) => !lead.includes(b));
   return (
     <div className="ev-stack">
-      {shown.map((b) => (
+      {lead.map((b) => (
         <div key={b.key}>{b.node}</div>
+      ))}
+      {rest.map((b) => (
+        <details key={b.key} className="acc-item ev-more" open={!relevantOnly}>
+          <summary>
+            <span className="acc-title">{b.title}</span>
+            <span className="muted small">{b.note}</span>
+            <ChevronDown size={16} className="acc-chev" aria-hidden />
+          </summary>
+          <div className="acc-body">{b.node}</div>
+        </details>
       ))}
     </div>
   );

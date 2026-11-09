@@ -12,7 +12,7 @@
     "start": "node --experimental-strip-types server/standalone.ts",
     "lint": "eslint .",
     "preview": "vite preview",
-    "test": "node --experimental-strip-types --test src/lib/__tests__/engine.test.ts",
+    "test": "node --experimental-strip-types --test src/lib/__tests__/engine.test.ts server/__tests__/store.test.ts server/__tests__/access.test.ts",
     "make-samples": "node scripts/make-samples.mjs"
   },
   "dependencies": {
