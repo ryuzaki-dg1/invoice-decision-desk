@@ -2,6 +2,18 @@
 
 An exception-first accounts-payable workspace. It takes a vendor invoice (digital PDF, scanned PDF or a photo of a handwritten bill), checks it against purchase orders, the vendor master and invoice history, and returns a decision. For every exception it shows **what happened, why it matters, the evidence, and what the AP team should do next**, then records how a reviewer resolved it.
 
+## Live demo
+
+**https://invoice-decision-desk-production.up.railway.app**
+
+The hosted version is an **open-access demo running on synthetic data** (the sample invoices, vendor master, purchase orders and ERP history in `app/src/data` and `app/public/samples` are made up). There is no sign-in, which has these consequences:
+
+- Anyone with the link can upload an invoice, and every upload calls the AI model on the demo's API key. Heavy use can exhaust the model's quota, so extraction may be slow or temporarily unavailable ("AI service temporarily unavailable", then **Retry**).
+- All visitors share one set of records. Anyone can approve, reject or correct cases, enter any reviewer name, and use **Reset demo data**, which clears every case and audit trail. What you see may have been changed by someone else.
+- Please upload only synthetic or non-sensitive documents. Uploaded files and extracted data are stored on the demo server.
+
+This is how the demo is configured (`ALLOW_OPEN_ACCESS=true`, `ENABLE_RESET=true`, with a volume at `DATA_DIR`). For anything beyond a demo, run it with `DEMO_ACCESS_KEY` set (see Deploy), which puts every route behind a server-checked key.
+
 > Built on top of [jwaldor/ap-exception](https://github.com/jwaldor/ap-exception) (React + Node scaffold, LLM proxy pattern). The pipeline, decision engine, review workflow, data model, run store and UI were rewritten for this case study.
 
 ## Product principle
@@ -31,7 +43,7 @@ Key rules:
 - **Inferred PO:** shown as a *suggested* match (`PO_MATCH_UNCONFIRMED`) that a reviewer must confirm.
 - **Duplicates:** conservative invoice-number normalisation (case, spaces, punctuation, a leading "INV"/"Invoice No" label, leading zeros), scoped to the same vendor. Identity is vendor + invoice number, not the file, so a reformatted PDF or a changed amount under the same number is still a duplicate/conflict and is rejected with a note that the amount differs, never paid as a second payable. The same number from an unrelated vendor is not a duplicate. Same amount with a different number is only a *possible* duplicate. A byte-identical re-upload is recorded as a repeat submission and never adds a payable.
 - **Missing and unverifiable payment details:** matching account = Passed; account differs = payment hold; **no account printed (or too few digits to compare) = "Not provided / Not verified"**. The policy is unchanged (payment would go to the account on file, so it does not block approval), but the app never shows it as verified.
-- **Missing invoice number:** the primary action is **Request clarification** (a revised invoice from the vendor). The number cannot be typed in by a reviewer; other missing fields can only be corrected with a cited source.
+- **Invoice number: correct a misread, never supply a missing one.** If the model extracted a number but may have misread it (for example a handwritten `1O47` for `1047`), a reviewer can correct it, with a reason and a cited source (where it appears on the document), and the server re-runs the duplicate check on the corrected value. If the document has **no invoice number at all**, a reviewer cannot enter one. The server rejects the attempt, and the primary action is **Request clarification** (ask the vendor for a revised invoice). The same reason-plus-source requirement applies to every other corrected field.
 - **Approved ≠ paid:** "paid" is only said when the ERP history has a payment record (seeded demo data). Invoices approved here are "approved for payment, not yet paid".
 
 ## Understand → Control → Resolve
@@ -69,7 +81,7 @@ Key rules:
 | PO overage / quantity / price / expiry | **Resolve PO discrepancy**: record who authorised the amendment and its reference. The PO record isn't silently changed. A corrected invoice goes through "Correct extracted fields" instead. |
 | Suggested PO | **Confirm suggested PO** |
 | Handwritten / uncertain read | **Confirm extracted information**. It does not approve. |
-| Arithmetic / missing fields / no PO | **Correct extracted fields** with a specific reason and a cited source; the server re-runs every rule. A missing invoice number is not correctable: request a revised invoice |
+| Arithmetic / missing fields / no PO | **Correct extracted fields** with a specific reason and a cited source; the server re-runs every rule. A *misread* invoice number can be corrected; a *missing* one cannot, so request a revised invoice |
 | Unknown vendor | Cannot be approved here: request onboarding (awaiting vendor), keep on hold, or reject |
 | Possible duplicate / above limit | Approve with justification |
 
@@ -81,8 +93,8 @@ Every status change requires a reviewer name (lightweight demo identity) and a s
 
 1. The model extracts what it can and reports fields it is unsure of (self-reported, not a calibrated score). Missing values stay missing.
 2. Handwritten invoices always go to review (configurable policy). The investigation screen shows the document beside an editable field form, marking each field as **missing**, **inconsistent**, **model unsure**, **not yet confirmed**, or **corrected**.
-3. A reviewer can correct the invoice number, date, PO reference, quantities, unit prices, line amounts, subtotal, tax, freight, discount and total. **Vendor name and bank account are deliberately not editable.**
-4. Saving sends the corrected invoice to the server, which **re-runs every deterministic check** (arithmetic, vendor, PO, cumulative billing, quantity, price, duplicates) with the run's own policy snapshot. The result can go up or down; a correction that creates a duplicate is rejected.
+3. A reviewer can correct the invoice number (only if one was extracted, i.e. fixing a misread; a blank invoice number is not editable, see the invoice-number rule above), date, PO reference, quantities, unit prices, line amounts, subtotal, tax, freight, discount and total. **Vendor name and bank account are deliberately not editable.**
+4. Saving sends the corrected invoice to the server, which **re-runs every deterministic check** (arithmetic, vendor, PO, cumulative billing, quantity, price, duplicates) using the server's policy thresholds. The result can go up or down; a correction that creates a duplicate is rejected.
 5. The audit keeps the original extraction and records each change (field, from → to), reviewer, time and reason. Earlier PO and figure confirmations are cleared, because the data changed.
 6. Approval stays locked while the invoice doesn't reconcile or is missing fields, and until the reviewer confirms the figures and any suggested PO. A clean result after a correction still needs an explicit approval.
 7. With no PO printed, ranked **PO suggestions** show their reasons (same vendor, amount fit, matching lines). Weak matches (low amount fit, no matching lines, or over the open value) are collapsed under "Weak matches" with the reason they don't fit. Applying one is a recorded correction that re-runs every rule, and a PO the reviewer chose stays *unconfirmed* until the PO owner confirms it, so selecting a PO never silently clears the PO control.
@@ -153,9 +165,9 @@ Set them in `app/.env` (local only, never commit it) or in the host's environmen
 | `DATA_DIR` | No | Where `runs.json` and page previews are stored (default `./data`). Mount a volume here in production. |
 | `PORT` | No | HTTP port (default `3000`) |
 | `HTTPS_PROXY` | No | Outbound proxy for model calls, if the host needs one |
-| `DEMO_ACCESS_KEY` | **Yes in production** | Server-enforced access key (12+ chars). Every route except a bare `/api/health` needs it; the browser shows a sign-in prompt (any username, key as password). Never placed in the frontend bundle. Without it the production server refuses to start. |
+| `DEMO_ACCESS_KEY` | **Yes in production, unless `ALLOW_OPEN_ACCESS=true`** | Server-enforced access key (12+ chars). Every route except a bare `/api/health` needs it; the browser shows a sign-in prompt (any username, key as password). Never placed in the frontend bundle. Without it (and without `ALLOW_OPEN_ACCESS=true`) the production server refuses to start. |
 | `ENABLE_RESET` | No | Set `true` to allow "Reset demo data" in production (disabled by default there; always allowed in local dev) |
-| `ALLOW_OPEN_ACCESS` | No | `true` lets production start with no access key. Not recommended. |
+| `ALLOW_OPEN_ACCESS` | No | `true` lets production start with no access key. Used by the hosted open-access demo; not for real data. |
 | `HOST` | No | Bind address. Unset = all interfaces |
 
 ## Testing
@@ -173,13 +185,18 @@ docker run -p 3000:3000 -e GEMINI_API_KEY=... invoice-desk
 
 Runs are stored in `DATA_DIR` (default `./data`): `runs.json` plus page previews in `docs/`. Attach a volume to keep them across deploys. The container listens on `PORT` (3000) and exposes `/api/health` for health checks (`railway.toml`). `.dockerignore` keeps `.env`, `node_modules` and local data out of the image.
 
-**Before exposing it publicly:** set `DEMO_ACCESS_KEY` (a shared demo key, not per-user login; see limits below) and mount a persistent volume at `DATA_DIR` (for example `DATA_DIR=/data`). Policy thresholds are fixed on the server; the Policy page only previews the effect of changes.
+**Two ways to run it online:**
+
+- **Protected (recommended for anything beyond a demo):** set `DEMO_ACCESS_KEY`. Every route except a bare `/api/health` then needs the key (browser sign-in prompt: any username, the key as password), and the server refuses to start without it.
+- **Open-access demo (what the hosted demo above uses):** set `ALLOW_OPEN_ACCESS=true` and no key. Anyone with the URL can use the app, spend the model quota and change or reset the shared records (`ENABLE_RESET=true` enables the reset button in production; it is off by default there). Only do this with synthetic data.
+
+Either way, mount a persistent volume at `DATA_DIR` (for example `DATA_DIR=/data`), set one of the model keys, and let the platform supply `PORT`. Policy thresholds are fixed on the server; the Policy page only previews the effect of changes.
 
 ## Assumptions and limits
 
 - One company, USD, 2-way match (invoice ↔ PO). Goods receipts (3-way match) would slot into the PO stage.
 - The PO table, vendor master and ERP payment history are static demo files standing in for an ERP. Run history is a JSON file. Production would use the ERP API and a database.
-- Policy thresholds are fixed on the server (`DEFAULT_RULES`); anything a browser sends is ignored. Changing them means editing `policy.ts` and redeploying. Reviewer identity is a typed name, not authentication. The only access control is one shared `DEMO_ACCESS_KEY` (HTTP Basic, no rate limiting, no per-user accounts), so anyone holding the key can act as any reviewer. Use a long random key and serve over HTTPS (the key is sent on every request); for real use put it behind SSO or a private network.
+- Policy thresholds are fixed on the server (`DEFAULT_RULES`); anything a browser sends is ignored. Changing them means editing `policy.ts` and redeploying. Reviewer identity is a typed name, not authentication. The only access control is the optional shared `DEMO_ACCESS_KEY` (HTTP Basic, no rate limiting, no per-user accounts), so anyone holding the key can act as any reviewer. **The hosted demo runs with no key at all**, so there is effectively no access control or per-user separation there. Use a long random key and serve over HTTPS (the key is sent on every request); for real use put it behind SSO or a private network.
 - Bank verification and PO authorisation are reviewer attestations (name, reference, justification, time). The app does not contact the vendor or the PO owner and never claims to have verified them.
 - Invoices arrive by upload; an email inbox listener would call the same pipeline. Up to 3 pages per invoice are sent to the model.
 - Low-confidence fields are the model's self-report, not a calibrated score. No source-position highlighting on the page image.
